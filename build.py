@@ -17,6 +17,9 @@ def build(args):
         raise ValueError(f'headers are for {release}, requested {args.kernel_release}')
     config = dict(re.findall(r'^(CONFIG_\w+)=(.*)$', (kdir / '.config').read_text(), re.M))
     command = ['make', '-C', str(kdir), f'M={root / "driver"}', 'W=1']
+    # Makefile assignments can override environment CC; command-line values win.
+    if 'CC' in os.environ:
+        command.append(f'CC={os.environ["CC"]}')
     # Cleanup must also target the requested kernel, independently of uname.
     if args.action == 'clean':
         return subprocess.run(command + ['clean'], check=False).returncode
@@ -46,6 +49,11 @@ def build(args):
         number = config.get('CONFIG_CLANG_VERSION' if clang else 'CONFIG_GCC_VERSION', '0')
         major = int(number) // 10000
         name = f'{compiler}-{major}'
+        if not clang:
+            recorded = config.get('CONFIG_CC_VERSION_TEXT', '').strip('"').split()
+            if (recorded and re.fullmatch(r'[\w.+-]*gcc-' + str(major), recorded[0])
+                    and shutil.which(recorded[0])):
+                name = recorded[0]
         if not shutil.which(name):
             raise ValueError(f'{name} is required, or explicitly set CC/LLVM')
         command.append(f'LLVM=-{major}' if clang else f'CC={name}')
