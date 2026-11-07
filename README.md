@@ -50,18 +50,86 @@ A Clang-built kernel requires the corresponding LLVM toolchain. The build
 helper reads the target kernel configuration and respects explicit `CC` or
 `LLVM` settings.
 
-Install the usual CA0132 DSP firmware (`ctefx-desktop.bin`, with `ctefx.bin`
-as the driver's fallback) and the AE-9 overlay `ae9-dsp-output-overlay.bin`
-in your system firmware directory, normally `/lib/firmware`. These binaries
-are **not included** here. Use known-good files from your existing setup or
-consult the [original project's firmware instructions](https://github.com/DarkNikGr/sb-ae9#readme)
-for their provenance and extraction.
+### 2. Obtain and install the firmware
+
+Install `curl`, `tar` and `innoextract` using your package manager.
+Two files are required: the main image `ctefx-desktop.bin` and the AE-9 overlay
+`ae9-dsp-output-overlay.bin`. **Creative firmware, Windows installers and
+extracted binaries are not redistributed by this project.** Obtain them from
+their original publisher and keep them outside the Git checkout.
+
+**Main image.** Use your distribution's official firmware package if it supplies
+`ctefx-desktop.bin` (for example, `alsa-firmware` on Fedora/Arch). Do not assume
+that `linux-firmware` supplies it on every distribution. Alternatively, obtain
+it from the [official ALSA firmware archive](https://www.alsa-project.org/files/pub/firmware/):
+
+```sh
+fw_work="$HOME/.cache/ae9-firmware"
+mkdir -p "$fw_work"
+curl --fail --location \
+  https://www.alsa-project.org/files/pub/firmware/alsa-firmware-1.2.4.tar.bz2 \
+  --output "$fw_work/alsa-firmware-1.2.4.tar.bz2"
+tar -xOf "$fw_work/alsa-firmware-1.2.4.tar.bz2" \
+  alsa-firmware-1.2.4/ca0132/ctefx-desktop.bin \
+  > "$fw_work/ctefx-desktop.bin"
+```
+
+**Overlay.** Download `AECMDMasterInstaller_3.4.92.00.exe` yourself from
+[Creative's official AE-9 support page](https://support.creative.com/Products/ProductDetails.aspx?prodID=23304&prodName=Sound+Blaster+AE-9%2F1000).
+Install `innoextract` with your package manager first. The following uses a
+fixed, reviewed revision of DarkNikGr's extractor, unpacks the Windows
+installer without executing it, and writes the overlay locally without root.
+Replace the `installer` path with the file you downloaded.
+
+```sh
+fw_work="$HOME/.cache/ae9-firmware"
+installer="/path/to/AECMDMasterInstaller_3.4.92.00.exe"
+(
+  command -v innoextract >/dev/null || exit 1
+  test -f "$installer" || exit 1
+  mkdir -p "$fw_work" || exit 1
+  cd "$fw_work" || exit 1
+  curl --fail --location \
+    https://raw.githubusercontent.com/DarkNikGr/sb-ae9/be71d1733bc12e1c2145d32a52c687055f7905ba/tools/ae9-firmware-extract.sh \
+    --output ae9-firmware-extract.sh || exit 1
+  printf '%s\n' \
+    '1718ee23b1b00ee8a01099ff3e214132d248cb9c567664454c58e2f2d1bee3d0  ae9-firmware-extract.sh' \
+    | sha256sum -c - || exit 1
+  bash ./ae9-firmware-extract.sh --exe "$installer" \
+    --out "$fw_work/ae9-dsp-output-overlay.bin"
+)
+```
+
+**Verify and install.** These full SHA-256 values and sizes identify the files
+used by the micjack1 reference. If either differs, stop and report its source
+and version; do not force it or rename another project's overlay. The driver's
+`ctefx.bin` fallback is not proof of equivalent AE-9 behavior. Keep a copy of
+any existing working firmware before replacing it.
+
+```sh
+fw_work="$HOME/.cache/ae9-firmware"
+(
+  cd "$fw_work" || exit 1
+  printf '%s\n' \
+    'c9ab092e5717080bcd90971d44aa7d8d30778058ea691dda76320cd315dcc18e  ctefx-desktop.bin' \
+    'ecc0740bde7ead2be16526edb9d6089ca6413c672679ceeb33b0f13b712dfe1c  ae9-dsp-output-overlay.bin' \
+    | sha256sum -c - || exit 1
+  test "$(stat -c %s ctefx-desktop.bin)" = 655856 || exit 1
+  test "$(stat -c %s ae9-dsp-output-overlay.bin)" = 432 || exit 1
+  sudo install -d /lib/firmware || exit 1
+  sudo install -m 0644 ctefx-desktop.bin ae9-dsp-output-overlay.bin /lib/firmware/
+)
+```
+
+The guarded block exits before installation on a mismatch. `/lib/firmware`
+may resolve to `/usr/lib/firmware`. Refresh the initramfs if needed and reboot
+after installing the modules below; do not hot-reload HDA to test firmware.
 
 This package replaces the shared HDA core as well as the codec. Keep a working
 kernel available. If Secure Boot is enabled, follow your distribution's DKMS
 module-signing and key-enrollment procedure before rebooting.
 
-### 2. Get the driver
+### 3. Get the driver
 
 ```sh
 git clone --depth 1 --single-branch --branch ae9-driver https://github.com/s3boun3t/linux-ae9.git sb-ae9
@@ -78,7 +146,7 @@ If another AE-9 package provides either module, resolve that installation for
 the target kernel first. Do not install overlapping providers or overwrite an
 existing package with `--force`.
 
-### 3. Build and install with DKMS
+### 4. Build and install with DKMS
 
 From the repository root, for the currently running, supported kernel:
 
