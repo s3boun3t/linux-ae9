@@ -1,7 +1,8 @@
 {
-  "upstream_commit": "d48723711bae9b8cdc56719c448ba42fef28cbee",
-  "integrated_commit": "e1c1f3f0f524797bc551b35ae6f235fae124c0c5",
-  "codec_sha256": "0091d9e60abba48d8eba23bdaaa8cb7981bb2082b801b2a531fe0dbbe919e037",
-  "profile": "linux-ae9-7.4-rc1",
-  "hardware_validated": false
+  "driver_reference": "cleaned micjack1",
+  "reference_commit": "8173af67b5ec4f609e11655b31a88ed06f927d3e",
+  "codec_sha256": "a0108167955a27ceef2e19d2736c575dd1096bf237cef993b47338eb936b5d67",
+  "hda_core_reference": "ae9_build 7.0-based core, unchanged .c/.h files",
+  "development_kernel_adaptations": false,
+  "status": "DKMS preview; hardware qualification pending"
 }

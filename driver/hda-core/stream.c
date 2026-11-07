@@ -12,8 +12,8 @@
 #include <sound/pcm.h>
 #include <sound/hdaudio.h>
 #include <sound/hda_register.h>
-#include "trace.h"
 #include "local.h"
+#include "trace.h"
 
 /*
  * the hdac_stream library is intended to be used with the following
@@ -147,12 +147,8 @@ void snd_hdac_stream_start(struct hdac_stream *azx_dev)
 			stripe_ctl = snd_hdac_get_stream_stripe_ctl(bus, azx_dev->substream);
 		else
 			stripe_ctl = 0;
-		if (bus->access_sdnctl_in_dword)
-			snd_hdac_stream_updatel(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK,
-						stripe_ctl);
-		else
-			snd_hdac_stream_updateb(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK,
-						stripe_ctl);
+		snd_hdac_stream_updateb(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK,
+					stripe_ctl);
 	}
 	/* set DMA start and interrupt mask */
 	if (bus->access_sdnctl_in_dword)
@@ -171,22 +167,11 @@ EXPORT_SYMBOL_GPL(snd_hdac_stream_start);
  */
 static void snd_hdac_stream_clear(struct hdac_stream *azx_dev)
 {
-	struct hdac_bus *bus = azx_dev->bus;
-
-	if (bus->access_sdnctl_in_dword) {
-		snd_hdac_stream_updatel(azx_dev, SD_CTL,
-					SD_CTL_DMA_START | SD_INT_MASK, 0);
-		snd_hdac_stream_writeb(azx_dev, SD_STS, SD_INT_MASK); /* to be sure */
-		if (azx_dev->stripe)
-			snd_hdac_stream_updatel(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK, 0);
-	} else {
-		snd_hdac_stream_updateb(azx_dev, SD_CTL,
-					SD_CTL_DMA_START | SD_INT_MASK, 0);
-		snd_hdac_stream_writeb(azx_dev, SD_STS, SD_INT_MASK); /* to be sure */
-		if (azx_dev->stripe)
-			snd_hdac_stream_updateb(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK, 0);
-	}
-
+	snd_hdac_stream_updateb(azx_dev, SD_CTL,
+				SD_CTL_DMA_START | SD_INT_MASK, 0);
+	snd_hdac_stream_writeb(azx_dev, SD_STS, SD_INT_MASK); /* to be sure */
+	if (azx_dev->stripe)
+		snd_hdac_stream_updateb(azx_dev, SD_CTL_3B, SD_CTL_STRIPE_MASK, 0);
 	azx_dev->running = false;
 }
 
@@ -241,16 +226,12 @@ void snd_hdac_stream_reset(struct hdac_stream *azx_dev)
 {
 	unsigned char val;
 	int dma_run_state;
-	struct hdac_bus *bus = azx_dev->bus;
 
 	snd_hdac_stream_clear(azx_dev);
 
 	dma_run_state = snd_hdac_stream_readb(azx_dev, SD_CTL) & SD_CTL_DMA_START;
 
-	if (bus->access_sdnctl_in_dword)
-		snd_hdac_stream_updatel(azx_dev, SD_CTL, 0, SD_CTL_STREAM_RESET);
-	else
-		snd_hdac_stream_updateb(azx_dev, SD_CTL, 0, SD_CTL_STREAM_RESET);
+	snd_hdac_stream_updateb(azx_dev, SD_CTL, 0, SD_CTL_STREAM_RESET);
 
 	/* wait for hardware to report that the stream entered reset */
 	snd_hdac_stream_readb_poll(azx_dev, SD_CTL, val, (val & SD_CTL_STREAM_RESET), 3, 300);
@@ -258,10 +239,7 @@ void snd_hdac_stream_reset(struct hdac_stream *azx_dev)
 	if (azx_dev->bus->dma_stop_delay && dma_run_state)
 		udelay(azx_dev->bus->dma_stop_delay);
 
-	if (bus->access_sdnctl_in_dword)
-		snd_hdac_stream_updatel(azx_dev, SD_CTL, SD_CTL_STREAM_RESET, 0);
-	else
-		snd_hdac_stream_updateb(azx_dev, SD_CTL, SD_CTL_STREAM_RESET, 0);
+	snd_hdac_stream_updateb(azx_dev, SD_CTL, SD_CTL_STREAM_RESET, 0);
 
 	/* wait for hardware to report that the stream is out of reset */
 	snd_hdac_stream_readb_poll(azx_dev, SD_CTL, val, !(val & SD_CTL_STREAM_RESET), 3, 300);

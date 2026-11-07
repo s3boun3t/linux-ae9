@@ -70,7 +70,10 @@ void snd_hdac_display_power(struct hdac_bus *bus, unsigned int idx, bool enable)
 	dev_dbg(bus->dev, "display power %s\n", str_enable_disable(enable));
 
 	guard(mutex)(&bus->lock);
-	assign_bit(idx, &bus->display_power_status, enable);
+	if (enable)
+		set_bit(idx, &bus->display_power_status);
+	else
+		clear_bit(idx, &bus->display_power_status);
 
 	if (!acomp || !acomp->ops)
 		return;
