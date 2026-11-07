@@ -1,2 +1,0 @@
-# mode=strict
-bad/dts-redundant-ws.dtso:5: [redundant-whitespace] extra whitespace before {

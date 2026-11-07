@@ -1,0 +1,7 @@
+{
+  "upstream_commit": "d48723711bae9b8cdc56719c448ba42fef28cbee",
+  "integrated_commit": "e1c1f3f0f524797bc551b35ae6f235fae124c0c5",
+  "codec_sha256": "0091d9e60abba48d8eba23bdaaa8cb7981bb2082b801b2a531fe0dbbe919e037",
+  "profile": "linux-ae9-7.4-rc1",
+  "hardware_validated": false
+}

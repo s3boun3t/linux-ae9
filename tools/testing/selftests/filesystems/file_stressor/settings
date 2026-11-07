@@ -1,3 +1,0 @@
-# Timeout for file_stressor test
-# The test runs for 900 seconds (15 minutes) plus setup/teardown time
-timeout=1800

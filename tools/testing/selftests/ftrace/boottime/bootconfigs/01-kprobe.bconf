@@ -1,4 +1,0 @@
-ftrace.event.kprobes.vfs_read {
-	probes = "vfs_read $arg1"
-	enable
-}

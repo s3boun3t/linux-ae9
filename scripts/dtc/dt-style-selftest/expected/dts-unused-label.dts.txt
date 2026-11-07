@@ -1,2 +1,0 @@
-# mode=stricter
-bad/dts-unused-label.dts:16: [unused-labels-dts] label 'dev' defined but never &-referenced

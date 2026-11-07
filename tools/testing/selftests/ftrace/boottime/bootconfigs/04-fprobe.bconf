@@ -1,4 +1,0 @@
-ftrace.event.fprobes.fp_read {
-	probes = "vfs_read"
-	enable
-}

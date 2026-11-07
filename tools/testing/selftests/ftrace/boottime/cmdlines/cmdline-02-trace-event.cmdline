@@ -1,1 +1,0 @@
-trace_event=sched:sched_switch,kmem:kmalloc

@@ -1,4 +1,0 @@
-# NOTE: keep in sync between .../net/ and .../drivers/net/
-
-[lint]
-ignore = ["C401", "I001", "RUF015"]
