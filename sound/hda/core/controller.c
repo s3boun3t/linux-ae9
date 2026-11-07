@@ -86,6 +86,9 @@ void snd_hdac_bus_init_cmd_io(struct hdac_bus *bus)
 		snd_hdac_chip_writeb(bus, RIRBCTL, AZX_RBCTL_DMA_EN | AZX_RBCTL_IRQ_EN);
 	/* Accept unsolicited responses */
 	snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
+	/* flush the CORB/RIRB setup writes before anything else touches the ring */
+	if (hdac_bus_needs_posted_flush(bus))
+		snd_hdac_chip_readl(bus, GCTL);
 }
 EXPORT_SYMBOL_GPL(snd_hdac_bus_init_cmd_io);
 
@@ -624,6 +627,10 @@ static void azx_int_clear(struct hdac_bus *bus)
 
 	/* clear int status */
 	snd_hdac_chip_writel(bus, INTSTS, AZX_INT_CTRL_EN | AZX_INT_ALL_STREAM);
+
+	/* flush the burst of posted writes before touching the CORB/RIRB */
+	if (hdac_bus_needs_posted_flush(bus))
+		snd_hdac_chip_readl(bus, INTSTS);
 }
 
 /**
