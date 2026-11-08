@@ -1,0 +1,19 @@
+{
+  "ubuntu-7.0": {
+    "release": "7.0.0-42-generic",
+    "headers": "usr/src/linux-headers-7.0.0-42-generic",
+    "compiler": "gcc-13",
+    "packages": [
+      {
+        "name": "linux-hwe-7.0-headers-7.0.0-42_7.0.0-42.42~24.04.1_all.deb",
+        "url": "https://archive.ubuntu.com/ubuntu/pool/main/l/linux-hwe-7.0/linux-hwe-7.0-headers-7.0.0-42_7.0.0-42.42~24.04.1_all.deb",
+        "sha256": "240fa7af3e36fd2b60fe0179f9b4fb4960f7e9b6f5f0c8c513c89b98399b6cc6"
+      },
+      {
+        "name": "linux-headers-7.0.0-42-generic_7.0.0-42.42~24.04.1_amd64.deb",
+        "url": "https://archive.ubuntu.com/ubuntu/pool/main/l/linux-hwe-7.0/linux-headers-7.0.0-42-generic_7.0.0-42.42~24.04.1_amd64.deb",
+        "sha256": "6ec137b06cf448982eef5e6d91e81f7985f6389b7bc844f89fb8fbfa9924e913"
+      }
+    ]
+  }
+}

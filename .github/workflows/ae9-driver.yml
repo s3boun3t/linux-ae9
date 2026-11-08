@@ -1,0 +1,104 @@
+name: AE-9 driver checks
+
+on:
+  push:
+    branches: [ae9-driver]
+    paths:
+      - '.github/workflows/ae9-driver.yml'
+      - 'driver/**'
+      - 'build.py'
+      - 'Makefile'
+      - 'dkms.conf'
+      - 'source.json'
+      - 'install/**'
+      - 'ci/build.py'
+      - 'ci/headers.py'
+      - 'ci/kernels.json'
+      - 'tests/test_build.py'
+  pull_request:
+    branches: [ae9-driver]
+    paths:
+      - '.github/workflows/ae9-driver.yml'
+      - 'driver/**'
+      - 'build.py'
+      - 'Makefile'
+      - 'dkms.conf'
+      - 'source.json'
+      - 'install/**'
+      - 'ci/build.py'
+      - 'ci/headers.py'
+      - 'ci/kernels.json'
+      - 'tests/test_build.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ae9-driver-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  checks:
+    name: Scripts and both modules (Ubuntu 7.0, GCC 13)
+    # Keep this first version on the public repository and driver branch.
+    if: >-
+      github.event.repository.private == false &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/ae9-driver')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Prepare disposable runner tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential gcc-13 libelf-dev libssl-dev
+          python3 --version
+          gcc-13 --version
+      - name: Check Python, shell and metadata syntax
+        run: |
+          python3 - <<'PY'
+          import ast
+          import json
+          from pathlib import Path
+          for name in ('build.py', 'install/desktop.py', 'ci/build.py', 'ci/headers.py', 'tests/test_build.py'):
+              ast.parse(Path(name).read_text(), filename=name)
+          for name in ('source.json', 'ci/kernels.json'):
+              json.loads(Path(name).read_text())
+          PY
+          sh -n install/desktop-hook
+          bash -n dkms.conf
+          git diff --check
+      - name: Test compiler selection without hardware
+        run: python3 -B tests/test_build.py
+      - name: Verify and extract pinned target headers
+        env:
+          HEADERS_OUTPUT: ${{ runner.temp }}/ae9-headers
+        run: python3 -B ci/headers.py --profile ubuntu-7.0 --output-dir "$HEADERS_OUTPUT"
+      - name: Build both modules and check cleanup (no installation)
+        env:
+          HEADERS_OUTPUT: ${{ runner.temp }}/ae9-headers
+          REPORTS: ${{ runner.temp }}/ae9-build-results
+        run: |
+          python3 -B ci/build.py \
+            --kernel-release 7.0.0-42-generic \
+            --kdir "$HEADERS_OUTPUT/usr/src/linux-headers-7.0.0-42-generic" \
+            --output-dir "$REPORTS"
+      - name: Print build diagnostics in the job log
+        if: always()
+        env:
+          REPORTS: ${{ runner.temp }}/ae9-build-results
+        run: |
+          if [[ -d "$REPORTS" ]]; then
+            find "$REPORTS" -type f \( -name '*.log' -o -name 'summary.json' \) -print -exec cat {} \;
+          fi
