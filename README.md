@@ -116,13 +116,26 @@ fw_work="$HOME/.cache/ae9-firmware"
     | sha256sum -c - || exit 1
   test "$(stat -c %s ctefx-desktop.bin)" = 655856 || exit 1
   test "$(stat -c %s ae9-dsp-output-overlay.bin)" = 432 || exit 1
-  sudo install -d /lib/firmware || exit 1
-  sudo install -m 0644 ctefx-desktop.bin ae9-dsp-output-overlay.bin /lib/firmware/
+  sudo install -d /lib/firmware/creative/ae9 || exit 1
+  sudo install -m 0644 ctefx-desktop.bin ae9-dsp-output-overlay.bin \
+    /lib/firmware/creative/ae9/
 )
 ```
 
-The guarded block exits before installation on a mismatch. `/lib/firmware`
-may resolve to `/usr/lib/firmware`. Refresh the initramfs if needed and reboot
+The guarded block exits before installation on a mismatch. The two image
+hashes above are unchanged; only their preferred installation directory changes.
+The driver first searches `creative/ae9/` under the standard firmware directories.
+If a preferred file is absent, it tries the old root-level name. Existing
+installations can therefore keep both files in `/lib/firmware/`; do not move or
+remove those files if another CA0132 driver uses them. A read error or an
+unexpected image size is reported as a failure, without trying another image.
+The kernel checks sizes (and the overlay layout), not cryptographic identity;
+the SHA-256 checks above remain required before installation. The historical
+`ctefx.bin` fallback remains when neither main-image location exists, but it
+is not the qualified AE-9 image.
+
+`/lib/firmware` may resolve to `/usr/lib/firmware`. The driver creates no folders
+and copies no files. Refresh the initramfs if needed and reboot
 after installing the modules below; do not hot-reload HDA to test firmware.
 
 This package replaces the shared HDA core as well as the codec. Keep a working

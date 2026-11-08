@@ -82,17 +82,22 @@
 #define EFX_FILE   "ctefx.bin"
 #define DESKTOP_EFX_FILE   "ctefx-desktop.bin"
 #define R3DI_EFX_FILE  "ctefx-r3di.bin"
+#define AE9_DESKTOP_FW "creative/ae9/ctefx-desktop.bin"
+#define AE9_DESKTOP_FW_BYTES 655856
 
 #ifdef CONFIG_SND_HDA_CODEC_CA0132_DSP
 MODULE_FIRMWARE(EFX_FILE);
 MODULE_FIRMWARE(DESKTOP_EFX_FILE);
 MODULE_FIRMWARE(R3DI_EFX_FILE);
+MODULE_FIRMWARE(AE9_DESKTOP_FW);
 #endif
 
 /* AE-9 output-connect overlay: keep the existing unconditional metadata. */
 #define AE9_OVERLAY_FW		"ae9-dsp-output-overlay.bin"
 #define AE9_OVERLAY_WORDS	108
+#define AE9_OVERLAY_FW_PATH "creative/ae9/ae9-dsp-output-overlay.bin"
 MODULE_FIRMWARE(AE9_OVERLAY_FW);
+MODULE_FIRMWARE(AE9_OVERLAY_FW_PATH);
 
 /* AE-9 clock diagnostic limits and snapshot layout. */
 #define AE9_CLOCK_READ_MS	100
@@ -9523,6 +9528,32 @@ static void ae9_post_dsp_finish(struct hda_codec *codec)
  * own verification.
  */
 
+/* Prefer the AE-9 directory; only an absent file permits a legacy lookup. */
+static int ae9_request_firmware(struct hda_codec *codec,
+				const struct firmware **fw, const char *name,
+				const char *legacy_name, size_t expected_size)
+{
+	int err;
+
+	*fw = NULL;
+	/* Avoid userspace fallback delays for the optional preferred path. */
+	err = request_firmware_direct(fw, name, codec->card->dev);
+	if (err == -ENOENT) {
+		name = legacy_name;
+		err = request_firmware(fw, name, codec->card->dev);
+	}
+	if (err)
+		return err;
+	if ((*fw)->size != expected_size) {
+		codec_err(codec, "AE-9: invalid firmware %s size %zu (expected %zu)\n",
+			  name, (*fw)->size, expected_size);
+		release_firmware(*fw);
+		*fw = NULL;
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int ae9_validate_overlay(const struct firmware *fw)
 {
 	static const struct {
@@ -9582,7 +9613,9 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	 * Use the DSP loader's 0x3a/0x3b protocol to transfer the patch.
 	 * Do not precede it with another direct DSPDMAC transfer.
 	 */
-	err = request_firmware(&ovl_fw, AE9_OVERLAY_FW, codec->card->dev);
+	err = ae9_request_firmware(codec, &ovl_fw, AE9_OVERLAY_FW_PATH,
+				   AE9_OVERLAY_FW,
+				   AE9_OVERLAY_WORDS * sizeof(u32));
 	if (err < 0) {
 		codec_err(codec, "AE-9: missing overlay %s: %d\n",
 			  AE9_OVERLAY_FW, err);
@@ -11775,6 +11808,7 @@ static void ca0132_set_dsp_msr(struct hda_codec *codec, bool is96k)
 static bool ca0132_download_dsp_images(struct hda_codec *codec)
 {
 	bool dsp_loaded = false;
+	int err;
 	struct ca0132_spec *spec = codec->spec;
 	const struct dsp_image_seg *dsp_os_image;
 	const struct firmware *fw_entry = NULL;
@@ -11784,10 +11818,15 @@ static bool ca0132_download_dsp_images(struct hda_codec *codec)
 	 * it needs it again.
 	 */
 	switch (ca0132_quirk(spec)) {
+	case QUIRK_AE9:
+		err = ae9_request_firmware(codec, &fw_entry, AE9_DESKTOP_FW,
+					   DESKTOP_EFX_FILE, AE9_DESKTOP_FW_BYTES);
+		if (err && err != -ENOENT)
+			return false;
+		break;
 	case QUIRK_SBZ:
 	case QUIRK_R3D:
 	case QUIRK_AE5:
-	case QUIRK_AE9:
 		if (request_firmware(&fw_entry, DESKTOP_EFX_FILE,
 					codec->card->dev) != 0)
 			codec_dbg(codec, "Desktop firmware not found.");
