@@ -74,6 +74,8 @@
 #define MEM_CONNID_DSP        16
 #define MEM_CONNID_DMIC       100
 
+#define SCP_MAX_DATA_WORDS 16
+
 #define SCP_SET    0
 #define SCP_GET    1
 
@@ -1191,7 +1193,7 @@ struct ca0132_spec {
 	unsigned int wait_scp_header;
 	unsigned int wait_num_data;
 	unsigned int scp_resp_header;
-	unsigned int scp_resp_data[4];
+	unsigned int scp_resp_data[SCP_MAX_DATA_WORDS];
 	unsigned int scp_resp_count;
 	/*
 	 * AE-9 overlay loader: set around dspload_image() by startup, cleared
@@ -2443,8 +2445,6 @@ extract_scp_header(unsigned int header,
 		*target_id = header & 0xff;
 }
 
-#define SCP_MAX_DATA_WORDS  (16)
-
 /* Structure to contain any SCP message */
 struct scp_msg {
 	unsigned int hdr;
@@ -2467,17 +2467,24 @@ static int dspio_get_response_data(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int data = 0;
-	unsigned int count;
+	unsigned int count, data_size;
+	int err;
 
 	if (dspio_read(codec, &data) < 0)
 		return -EIO;
 
 	if ((data & 0x00ffffff) == spec->wait_scp_header) {
 		spec->scp_resp_header = data;
-		spec->scp_resp_count = data >> 27;
-		count = spec->wait_num_data;
-		dspio_read_multiple(codec, spec->scp_resp_data,
-				    &spec->scp_resp_count, count);
+		data_size = data >> 27;
+		spec->scp_resp_count = data_size;
+		count = min_t(unsigned int, spec->wait_num_data,
+			      ARRAY_SIZE(spec->scp_resp_data));
+		err = dspio_read_multiple(codec, spec->scp_resp_data,
+					  &spec->scp_resp_count, count);
+		if (err < 0)
+			return err;
+		if (spec->scp_resp_count != data_size)
+			return -EIO;
 		return 0;
 	}
 
@@ -2530,7 +2537,9 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 		spec->wait_scp_header |= (resp_src_id << 8) | (resp_target_id);
 		/* dspio_get_response_data() compares the reply's low 24 bits */
 		spec->wait_scp_header &= 0x00ffffff;
-		spec->wait_num_data = return_buf_size/sizeof(unsigned int) - 1;
+		spec->wait_num_data = min_t(unsigned int,
+					    return_buf_size / sizeof(unsigned int) - 1,
+					    ARRAY_SIZE(spec->scp_resp_data));
 		spec->wait_scp = 1;
 		waiting_for_resp = true;
 	}
@@ -2562,12 +2571,19 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 		} while (time_before(jiffies, timeout));
 		waiting_for_resp = false;
 		if (!spec->wait_scp) {
-			ret_msg = (struct scp_msg *)return_buf;
-			memcpy(&ret_msg->hdr, &spec->scp_resp_header, 4);
-			memcpy(&ret_msg->data, spec->scp_resp_data,
-			       spec->wait_num_data);
-			*bytes_returned = (spec->scp_resp_count + 1) * 4;
-			status = 0;
+			data_size = spec->scp_resp_count;
+			if (data_size > ARRAY_SIZE(spec->scp_resp_data) ||
+			    data_size > return_buf_size / sizeof(unsigned int) - 1) {
+				status = -EIO;
+			} else {
+				ret_msg = (struct scp_msg *)return_buf;
+				memcpy(&ret_msg->hdr, &spec->scp_resp_header,
+				       sizeof(ret_msg->hdr));
+				memcpy(ret_msg->data, spec->scp_resp_data,
+				       data_size * sizeof(spec->scp_resp_data[0]));
+				*bytes_returned = (data_size + 1) * sizeof(unsigned int);
+				status = 0;
+			}
 		} else {
 			status = -EIO;
 		}
