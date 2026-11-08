@@ -12,6 +12,7 @@ micjack1 driver as two DKMS modules: `snd-hda-core` and
 - SBX playback effects, microphone capture and microphone effects controls.
 - ACM headphone switching and 3.5 mm microphone jack presence reporting.
 - DAC digital filter selection.
+- Separate What U Hear capture PCM, with automatic desktop profile integration.
 
 Playback, ACM controls and microphone operation have been reported working on
 the reference Mint/XanMod system. Microphone jack presence is polled at roughly
@@ -21,7 +22,7 @@ sample-rate switching are not included in this branch.
 
 ## Compatibility
 
-This is a **DKMS preview**, version `0.2.0-preview1`, for **x86_64 Linux
+This is a **DKMS preview**, version `0.2.0-preview2`, for **x86_64 Linux
 7.0–7.3** with the expected stable HDA/ALSA APIs. The HDA core and CA0132
 codec must be configured as modules, not built into the kernel.
 
@@ -166,8 +167,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -198,12 +199,55 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
 replaced distribution modules, restore those from the distribution's kernel
 packages as well.
+
+## What U Hear in desktop applications
+
+DKMS installation also installs standard desktop profile data for the AE-9.
+With the normal **Analog Stereo Duplex** profile, the microphone and
+**AE-9 What U Hear** are exposed together after reboot, without a separate
+activation command. What U Hear records the card's playback mix; select it
+explicitly in the application that should capture that audio. Its lower
+selection priority keeps the microphone preferred. No additional resident
+program is installed.
+
+The integration is selected only for the AE-9 PCI subsystem. It extends the
+installed ACP default profiles, retains their playback mappings (including
+surround and optical), and does not edit the distribution's stock files or
+per-user settings. Microphone duplex profiles gain the separate ALSA PCM 2
+input. A lower-priority microphone-only profile remains available if What U
+Hear cannot be opened. Profiles containing only What U Hear use ACP fallback
+selection; the combined profile has the normal native stereo priority.
+Output-only, Off, Pro Audio and explicit custom profiles retain their normal
+behavior; they do not automatically gain this input.
+
+PipeWire with its ALSA card profiles and WirePlumber 0.4 or 0.5 is the target
+desktop setup. On the reference Mint system with PipeWire 1.0.5 and
+WirePlumber 0.4.17, a user trial confirmed automatic visibility, recording of
+playback through What U Hear, and continued microphone operation with the
+microphone retained as the default input. These observations cover the
+desktop profile data; the complete DKMS hook lifecycle has only been tested
+offline. WirePlumber 0.5 configuration has also only been checked offline.
+Systems without installed ACP profile data keep a kernel-only installation.
+Other session managers and distribution variants remain unqualified.
+
+The source is configured for stereo, 48 kHz, `S32_LE` with WirePlumber. This
+container format does not establish 32-bit signal precision. No sample-rate
+policy, playback effect, default-source setting or kernel route is changed.
+The installer does not restart services, trigger devices or start recording;
+use the normal reboot after installing the driver.
+
+DKMS removes its unchanged desktop data when the last kernel/package target
+using it is removed. Files edited by an administrator are preserved and
+reported for manual review. The ownership record is
+`/var/lib/sb-ae9/desktop-files.json`. Check the desktop hook messages during
+installation; a DKMS module installation alone does not prove that a desktop
+source was successfully created.
 
 ## Credits
 

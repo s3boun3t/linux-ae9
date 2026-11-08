@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Only the AE-9 PCI board supported by this driver; never other CA0132 cards.
+SUBSYSTEM=="sound", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0010", ATTRS{subsystem_vendor}=="0x1102", ATTRS{subsystem_device}=="0x0071", ENV{ACP_PROFILE_SET}="sb-ae9.conf"
