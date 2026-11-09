@@ -10794,6 +10794,7 @@ static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait
 	return n;
 }
 
+/* AE-9 ACM protocol: reply validation and command exchanges. */
 /* Match a complete reply before interpreting its command-specific payload. */
 static bool ae9_acm_reply_valid(const u8 *rx, int n, u8 cmd, u8 payload_len)
 {
@@ -10823,6 +10824,14 @@ static int ae9_acm_decode_button(const u8 *rx, int n, int button)
 		return 0;
 
 	return max(1, rx[5] | rx[6] << 8);
+}
+
+static int ae9_acm_decode_reg(const u8 *rx, int n, u8 reg)
+{
+	if (!ae9_acm_reply_valid(rx, n, 0x83, 2) || rx[3] != reg)
+		return -EIO;
+
+	return rx[4];
 }
 
 static int ae9_acm_cmd(struct ca0132_spec *spec, const u8 *p, int n)
@@ -10872,23 +10881,22 @@ static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 {
 	u8 q[5] = { 0xf0, 0x83, 0x01, reg, 0xf7 };
 	u8 rx[8];
-	int n;
+	int n, value;
 
 	n = ae9_acm_tx(spec, q, sizeof(q));
 	if (n < 0)
 		return n;
 	n = ae9_acm_rx(spec, rx, 6, 100);
-	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
-	    rx[3] != reg || rx[5] != 0xf7) {
+	value = ae9_acm_decode_reg(rx, n, reg);
+	if (value < 0) {
 		codec_info(spec->codec,
 			   "AE-9 ACM: invalid register reply reg=%02x len=%d bytes=%*ph\n",
 			   reg, n, n, rx);
 		return -EIO;
 	}
-	return rx[4];
+	return value;
 }
 
-/* AE-9 ACM display, mixer and button actions. */
 /* F0 11 09 <8 ASCII, NUL padded> 00 F7 : display text */
 static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, bool wait)
 {
@@ -10911,6 +10919,50 @@ static void ae9_acm_display(struct ca0132_spec *spec, const char *txt)
 {
 	ae9_acm_display_frame(spec, txt, true);
 }
+
+/*
+ * F0 22 02 01 <0|1> F7: the ACM's SBX light (Windows sends its SBX state; the
+ * capture had it on, which is why an earlier build lit it unconditionally).
+ */
+static void ae9_acm_set_fx_light(struct ca0132_spec *spec, bool on)
+{
+	u8 f[6] = { 0xf0, 0x22, 0x02, 0x01, on ? 0x01 : 0x00, 0xf7 };
+
+	ae9_acm_cmd(spec, f, sizeof(f));
+}
+
+/*
+ * F0 B1 01 <n> F7 -> RX 8: [3]==n, [4]==1 = a press happened, [5..6] = its
+ * length in ms (Windows 0x3f6b0: short press on button 1 = SBX toggle, long
+ * press = display on/off; button 2 = the knob: short = mute, mid = output
+ * toggle, long = LED). Returns the press length, 0 if none.
+ */
+static int ae9_acm_button(struct ca0132_spec *spec, int n)
+{
+	u8 q[5] = { 0xf0, 0xb1, 0x01, n, 0xf7 };
+	u8 rx[8];
+	int got;
+
+	if (!ae9_acm_button_tx(spec, q, sizeof(q)))
+		return 0;
+	got = ae9_acm_rx(spec, rx, sizeof(rx), 30);
+	return ae9_acm_decode_button(rx, got, n);
+}
+
+/* Return raw C2 direction/detents; volume policy belongs to the ALSA action. */
+static bool ae9_acm_read_knob(struct ca0132_spec *spec, int *dir, int *steps)
+{
+	static const u8 q[] = { 0xf0, 0xc2, 0x00, 0xf7 };
+	u8 rx[8];
+	int n;
+
+	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
+		return false;
+	n = ae9_acm_rx(spec, rx, 8, 30);
+	return ae9_acm_decode_knob(rx, n, dir, steps);
+}
+
+/* AE-9 ACM actions: consume decoded values and update ALSA or display text. */
 
 /*
  * 'Master Playback Volume' on the AE-9 follows the shared Headphone+LO output.
@@ -10996,46 +11048,16 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 	ae9_acm_display_frame(spec, txt, false);
 }
 
-/*
- * F0 22 02 01 <0|1> F7: the ACM's SBX light (Windows sends its SBX state; the
- * capture had it on, which is why an earlier build lit it unconditionally).
- */
-static void ae9_acm_set_fx_light(struct ca0132_spec *spec, bool on)
-{
-	u8 f[6] = { 0xf0, 0x22, 0x02, 0x01, on ? 0x01 : 0x00, 0xf7 };
-
-	ae9_acm_cmd(spec, f, sizeof(f));
-}
-
 static bool ae9_fx_enabled(struct ca0132_spec *spec)
 {
 	return spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] != 0;
 }
 
-/*
- * F0 B1 01 <n> F7 -> RX 8: [3]==n, [4]==1 = a press happened, [5..6] = its
- * length in ms (Windows 0x3f6b0: short press on button 1 = SBX toggle, long
- * press = display on/off; button 2 = the knob: short = mute, mid = output
- * toggle, long = LED). Returns the press length, 0 if none.
- */
-static int ae9_acm_button(struct ca0132_spec *spec, int n)
-{
-	u8 q[5] = { 0xf0, 0xb1, 0x01, n, 0xf7 };
-	u8 rx[8];
-	int got;
-
-	if (!ae9_acm_button_tx(spec, q, sizeof(q)))
-		return 0;
-	got = ae9_acm_rx(spec, rx, sizeof(rx), 30);
-	return ae9_acm_decode_button(rx, got, n);
-}
-
 /* The ACM's SBX button toggles Enable OutFX, like Windows does. */
-static void ae9_acm_service_buttons(struct hda_codec *codec)
+static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 {
 	struct ca0132_spec *spec = codec->spec;
 	struct snd_kcontrol *kctl;
-	int ms = ae9_acm_button(spec, 1);
 
 	if (!ms)
 		return;
@@ -11051,6 +11073,13 @@ static void ae9_acm_service_buttons(struct hda_codec *codec)
 	kctl = snd_hda_find_mixer_ctl(codec, "Enable OutFX Playback Switch");
 	if (kctl)
 		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+}
+
+static void ae9_acm_service_buttons(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	ae9_acm_apply_sbx_press(codec, ae9_acm_button(spec, 1));
 }
 
 /* Toggle a boolean/enum mixer control from the service and notify listeners. */
@@ -11085,21 +11114,14 @@ static void ae9_toggle_ctl(struct hda_codec *codec, const char *name, bool is_en
  * not applied: earlier polling produced +40..+64 jumps on normal turning.
  * The separate idle knob poll does not change this mapping.
  */
-static void ae9_acm_knob(struct hda_codec *codec)
+static void ae9_acm_apply_knob(struct hda_codec *codec, int dir, int detents)
 {
 	struct ca0132_spec *spec = codec->spec;
-	static const u8 q[] = { 0xf0, 0xc2, 0x00, 0xf7 };
 	struct snd_kcontrol *kctl;
 	struct snd_ctl_elem_value *uctl;
-	u8 rx[8];
-	int n, dir, steps, delta;
+	int n, steps = detents, delta;
 	long v, max_level;
 
-	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
-		return;
-	n = ae9_acm_rx(spec, rx, 8, 30);
-	if (!ae9_acm_decode_knob(rx, n, &dir, &steps))
-		return;
 	if (!steps)
 		return;
 	if (spec->ae9_knob_dir != dir) {
@@ -11118,7 +11140,9 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	if (v < 0 || !kctl || !kctl->put)
 		return;
 	v = clamp(v + delta, 0L, max_level);
-	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
+	codec_info(codec,
+		   "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n",
+		   dir, detents, delta, v);
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
 		return;
@@ -11132,15 +11156,23 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	ae9_acm_display_changed(spec);
 }
 
+static void ae9_acm_knob(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int dir, steps;
+
+	if (ae9_acm_read_knob(spec, &dir, &steps))
+		ae9_acm_apply_knob(codec, dir, steps);
+}
+
 /*
  * The knob is button 2 (Windows 0x3f6b0): short press = mute, press held
  * between AcmEncoderMidPressMs (1500) and LongPressMs (3000) = output toggle,
  * longer = encoder LED (not implemented).
  */
-static void ae9_acm_service_knob_press(struct hda_codec *codec)
+static void ae9_acm_apply_knob_press(struct hda_codec *codec, int ms)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int ms = ae9_acm_button(spec, 2);
 
 	if (!ms)
 		return;
@@ -11154,6 +11186,13 @@ static void ae9_acm_service_knob_press(struct hda_codec *codec)
 	} else {
 		codec_info(codec, "AE-9 ACM: knob long press (%d ms), ignored\n", ms);
 	}
+}
+
+static void ae9_acm_service_knob_press(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	ae9_acm_apply_knob_press(codec, ae9_acm_button(spec, 2));
 }
 
 /* AE-9 output selection and physical-jack updates. */
