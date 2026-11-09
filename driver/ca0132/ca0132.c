@@ -23,6 +23,7 @@
 #include <linux/ktime.h>
 #include <linux/jiffies.h>
 #include <linux/spinlock.h>
+#include <linux/bitops.h>
 #include <linux/unaligned.h>
 
 #include <asm/io.h>
@@ -1193,6 +1194,8 @@ struct ca0132_spec {
 
 	/* DSP download related */
 	enum dsp_download_state dsp_state;
+	/* AE-9: one SCP failure diagnostic per main firmware load attempt. */
+	unsigned long ae9_dsp_error_logged;
 	unsigned int dsp_stream_id;
 	unsigned int wait_scp;
 	unsigned int wait_scp_header;
@@ -2598,6 +2601,29 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 	return status;
 }
 
+/* Report the failed transaction without issuing more DSP/ChipIO accesses. */
+static void ae9_dsp_log_first_error(struct hda_codec *codec, const char *stage,
+				    int err, const struct scp_msg *send,
+				    unsigned int len,
+				    const struct scp_msg *reply,
+				    unsigned int reply_bytes)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int mod_id, src_id, req, get;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 ||
+	    test_and_set_bit(0, &spec->ae9_dsp_error_logged))
+		return;
+
+	extract_scp_header(send->hdr, &mod_id, &src_id, &get, &req,
+			   NULL, NULL, NULL, NULL);
+	codec_err(codec,
+		  "AE-9: first DSP error: stage=%s err=%d state=%d loader=%u tx=0x%08x mid=0x%02x src=0x%02x req=0x%02x dir=%s len=%u rx=0x%08x rx_bytes=%u\n",
+		  stage, err, READ_ONCE(spec->dsp_state),
+		  READ_ONCE(spec->ae9_loader_ctx), send->hdr, mod_id, src_id, req,
+		  get ? "GET" : "SET", len, reply->hdr, reply_bytes);
+}
+
 /**
  * dspio_scp - Prepare and send the SCP message to DSP
  * @codec: the HDA codec
@@ -2621,6 +2647,7 @@ static int dspio_scp(struct hda_codec *codec,
 	unsigned int ret_bytes, send_size, ret_size;
 	unsigned int send_get_flag, reply_resp_flag, reply_error_flag;
 	unsigned int reply_data_size;
+	const char *stage;
 
 	memset(&scp_send, 0, sizeof(scp_send));
 	memset(&scp_reply, 0, sizeof(scp_reply));
@@ -2653,7 +2680,8 @@ static int dspio_scp(struct hda_codec *codec,
 
 	if (status < 0) {
 		codec_dbg(codec, "dspio_scp: send scp msg failed\n");
-		return status;
+		stage = "transport";
+		goto error;
 	}
 
 	/* extract send and reply headers members */
@@ -2672,22 +2700,35 @@ static int dspio_scp(struct hda_codec *codec,
 
 		if (*reply_len < ret_size*sizeof(unsigned int)) {
 			codec_dbg(codec, "reply too long for buf\n");
-			return -EINVAL;
+			status = -EINVAL;
+			stage = "reply-capacity";
+			goto error;
 		} else if (ret_size != reply_data_size) {
 			codec_dbg(codec, "RetLen and HdrLen .NE.\n");
-			return -EINVAL;
+			status = -EINVAL;
+			stage = "reply-length";
+			goto error;
 		} else if (!reply) {
 			codec_dbg(codec, "NULL reply\n");
-			return -EINVAL;
+			status = -EINVAL;
+			stage = "reply-buffer";
+			goto error;
 		} else {
 			*reply_len = ret_size*sizeof(unsigned int);
 			memcpy(reply, scp_reply.data, *reply_len);
 		}
 	} else {
 		codec_dbg(codec, "reply ill-formed or errflag set\n");
-		return -EIO;
+		status = -EIO;
+		stage = "reply-flags";
+		goto error;
 	}
 
+	return status;
+
+error:
+	ae9_dsp_log_first_error(codec, stage, status, &scp_send, len,
+				&scp_reply, ret_bytes);
 	return status;
 }
 
@@ -11916,6 +11957,8 @@ static void ca0132_download_dsp(struct hda_codec *codec)
 
 	chipio_enable_clocks(codec);
 	if (spec->dsp_state != DSP_DOWNLOADED) {
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			clear_bit(0, &spec->ae9_dsp_error_logged);
 		spec->dsp_state = DSP_DOWNLOADING;
 
 		if (!ca0132_download_dsp_images(codec))
