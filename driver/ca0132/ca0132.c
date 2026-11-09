@@ -9470,10 +9470,11 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 	unsigned int i;
 
 	/*
-	 * Windows reads 0x0b/0x0e/0x07 back before modifying them; the
-	 * command engine's read primitive is not implemented here, so the
-	 * ES9038Q2M power-on defaults are assumed (0x0b=0x00, 0x0e=0x8a,
-	 * 0x07=0x80).
+	 * Windows reads 0x0b/0x0e/0x07 before modifying them. This stage
+	 * replays the captured writes instead of using the command-engine
+	 * read primitive, which is used by the bring-up diagnostics below.
+	 * The sequence assumes ES9038Q2M power-on defaults of 0x0b=0x00,
+	 * 0x0e=0x8a and 0x07=0x80.
 	 */
 	for (i = 0; i < ARRAY_SIZE(dac_init); i++)
 		ae9_dac_write(codec, dac_init[i].reg, dac_init[i].val);
@@ -10644,80 +10645,75 @@ failed:
 	return err;
 }
 
-/* Knob queries retain their DWORD readiness test and wait budget. */
-static bool ae9_acm_knob_tx(struct ca0132_spec *spec, const u8 *p, int n)
+/*
+ * Emit a knob/button query and return the number of bytes sent. The caller
+ * owns its channel's fault latch and reporting; never retry a partial frame.
+ * Keep the DWORD readiness test, RX drain and per-byte wait budget intact.
+ */
+static int ae9_acm_query_write(struct ca0132_spec *spec, const u8 *p, int n,
+			       u32 *status)
 {
 	void __iomem *b2 = spec->mem_base;
-	u32 status = 0;
 	int i, w;
+
+	*status = 0;
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			*status = readl(b2 + AE9_U_STS);
+			if (*status == ~0U)
+				return i;
+			if (*status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			return i;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	return i;
+}
+
+static bool ae9_acm_knob_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	u32 status;
+	int sent;
 
 	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_knob_tx_failed ||
 	    READ_ONCE(spec->ae9_acm_tx_failed))
 		return false;
-	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
-		(void)readb(b2 + AE9_U_RBR);
-	for (i = 0; i < n; i++) {
-		for (w = 0; w < 100; w++) {
-			/* Validate the display TX-ready bit for this query too. */
-			status = readl(b2 + AE9_U_STS);
-			if (status == ~0U)
-				goto failed;
-			if (status & 0x02)
-				break;
-			usleep_range(50, 100);
-		}
-		if (w == 100)
-			goto failed;
-		writeb(p[i], b2 + AE9_U_THR);
-		readb(b2 + AE9_U_LCR);
-	}
-	return true;
+	sent = ae9_acm_query_write(spec, p, n, &status);
+	if (sent >= n)
+		return true;
 
-failed:
 	/* Never continue or blindly resend a partially transmitted frame. */
 	spec->ae9_acm_knob_tx_failed = true;
 	codec_warn(spec->codec,
 		   "AE-9 ACM knob TX: FAILED sent=%d/%d status=%08x; knob polling stopped until reboot\n",
-		   i, n, status);
+		   sent, n, status);
 	return false;
 }
 
-/* B1 queries retain their separate DWORD readiness test and wait budget. */
 static bool ae9_acm_button_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
-	void __iomem *b2 = spec->mem_base;
-	u32 status = 0;
-	int i, w;
+	u32 status;
+	int sent;
 
 	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_button_tx_failed ||
 	    READ_ONCE(spec->ae9_acm_tx_failed))
 		return false;
-	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
-		(void)readb(b2 + AE9_U_RBR);
-	for (i = 0; i < n; i++) {
-		for (w = 0; w < 100; w++) {
-			/* Use the DWORD TX-ready test validated for display/C2. */
-			status = readl(b2 + AE9_U_STS);
-			if (status == ~0U)
-				goto failed;
-			if (status & 0x02)
-				break;
-			usleep_range(50, 100);
-		}
-		if (w == 100)
-			goto failed;
-		writeb(p[i], b2 + AE9_U_THR);
-		readb(b2 + AE9_U_LCR);
-	}
-	return true;
+	sent = ae9_acm_query_write(spec, p, n, &status);
+	if (sent >= n)
+		return true;
 
-failed:
 	/* Never continue or resend a partially transmitted frame. */
 	spec->ae9_acm_button_tx_failed = true;
 	codec_warn(spec->codec,
 		   "AE-9 ACM button TX: FAILED sent=%d/%d status=%08x; "
 		   "button queries stopped, restore previous codec\n",
-		   i, n, status);
+		   sent, n, status);
 	return false;
 }
 
