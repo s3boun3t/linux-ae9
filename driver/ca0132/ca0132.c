@@ -1312,7 +1312,7 @@ struct ca0132_spec {
 	 * ae9_output_mutex. Scheduler reads use READ_ONCE().
 	 */
 	bool ae9_acm_pending_mode;	/* Output Select changed: push HP/SP to the ACM */
-	/* Mixer callback and worker share pending_fx without a dedicated lock. */
+	/* Output mutex protects FX transactions/LED; scheduler uses READ_ONCE. */
 	bool ae9_acm_pending_fx;	/* Enable OutFX changed: update the ACM SBX light */
 	/* PM reference: acquired at probe, released by ca0132_free(). */
 	bool ae9_pm_held;		/* runtime-PM reference held: codec stays in D0 */
@@ -1332,8 +1332,8 @@ struct ca0132_spec {
 	 */
 	struct snd_jack *ae9_acm_mic_jack;	/* owned by the HDA jack table */
 	bool ae9_acm_mic_managed;	/* worker lifetime guard is registered */
-	/* Serialize ALSA/manual and worker-driven output selection. */
-	struct mutex ae9_output_mutex;	/* output selection and ACM mode */
+	/* Output selection, output-effect cache/DSP transactions and SBX LED. */
+	struct mutex ae9_output_mutex;
 	int ae9_acm_dead_ticks;		/* consecutive keepalive probes unanswered */
 	int ae9_acm_sel;		/* last module selector bits (items 5/6) */
 
@@ -4427,6 +4427,14 @@ static void r3di_gpio_dsp_status_set(struct hda_codec *codec,
 /*
  * PCM callbacks
  */
+/* PCM delay may not sleep; these reads are advisory, not an FX transaction. */
+static long ca0132_effect_switch_state(struct ca0132_spec *spec, hda_nid_t nid)
+{
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return READ_ONCE(spec->effects_switch[nid - EFFECT_START_NID]);
+	return spec->effects_switch[nid - EFFECT_START_NID];
+}
+
 static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when);
 static void ae9_clock_diag_request(struct hda_codec *codec, unsigned int format);
 static void ae9_clock_diag_cancel(struct ca0132_spec *spec);
@@ -4457,7 +4465,7 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 	/*If Playback effects are on, allow stream some time to flush
 	 *effects tail*/
 	ae9_clock_diag_cancel(spec);
-	if (spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID])
+	if (ca0132_effect_switch_state(spec, PLAY_ENHANCEMENT))
 		msleep(50);
 
 	snd_hda_codec_cleanup_stream(codec, spec->dacs[0]);
@@ -4477,9 +4485,9 @@ static unsigned int ca0132_playback_pcm_delay(struct hda_pcm_stream *info,
 		return 0;
 
 	/* Add latency if playback enhancement and either effect is enabled. */
-	if (spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID]) {
-		if ((spec->effects_switch[SURROUND - EFFECT_START_NID]) ||
-		    (spec->effects_switch[DIALOG_PLUS - EFFECT_START_NID]))
+	if (ca0132_effect_switch_state(spec, PLAY_ENHANCEMENT)) {
+		if (ca0132_effect_switch_state(spec, SURROUND) ||
+		    ca0132_effect_switch_state(spec, DIALOG_PLUS))
 			latency += DSP_PLAY_ENHANCEMENT_LATENCY;
 	}
 
@@ -6019,17 +6027,23 @@ static int ca0132_effects_set(struct hda_codec *codec, hda_nid_t nid, long val)
 /*
  * Turn on/off Playback Enhancements
  */
-static int ca0132_pe_switch_set(struct hda_codec *codec)
+static int __ca0132_pe_switch_set(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	hda_nid_t nid;
 	int i, err, ret = 0;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		lockdep_assert_held(&spec->ae9_output_mutex);
+
 	codec_dbg(codec, "ca0132_pe_switch_set: val=%ld\n",
 		    spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID]);
 
 	if (ca0132_use_alt_functions(spec)) {
-		err = ca0132_alt_select_out(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			err = __ca0132_alt_select_out(codec);
+		else
+			err = ca0132_alt_select_out(codec);
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
 	}
@@ -6045,6 +6059,32 @@ static int ca0132_pe_switch_set(struct hda_codec *codec)
 	}
 
 	return ret;
+}
+
+static int ca0132_pe_switch_set(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		return __ca0132_pe_switch_set(codec);
+	}
+	return __ca0132_pe_switch_set(codec);
+}
+
+/* The ALSA caller holds a codec power reference before taking this mutex. */
+static int ae9_outfx_switch_set(struct hda_codec *codec, hda_nid_t nid,
+				long value)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	WRITE_ONCE(spec->effects_switch[nid - EFFECT_START_NID], value);
+	if (nid == PLAY_ENHANCEMENT) {
+		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
+		return __ca0132_pe_switch_set(codec);
+	}
+	return ca0132_effects_set(codec, nid, value);
 }
 
 /* Check if Mic1 is streaming, if so, stop streaming */
@@ -7006,6 +7046,13 @@ static int ca0132_switch_get(struct snd_kcontrol *kcontrol,
 
 	/* effects, include PE and CrystalVoice */
 	if ((nid >= EFFECT_START_NID) && (nid < EFFECT_END_NID)) {
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    (nid == PLAY_ENHANCEMENT ||
+		     (nid >= OUT_EFFECT_START_NID && nid < OUT_EFFECT_END_NID))) {
+			guard(mutex)(&spec->ae9_output_mutex);
+			*valp = spec->effects_switch[nid - EFFECT_START_NID];
+			return 0;
+		}
 		*valp = spec->effects_switch[nid - EFFECT_START_NID];
 		return 0;
 	}
@@ -7060,11 +7107,14 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
 		return ca0132_vnode_switch_set(kcontrol, ucontrol);
 	}
 
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    (nid == PLAY_ENHANCEMENT ||
+	     (nid >= OUT_EFFECT_START_NID && nid < OUT_EFFECT_END_NID)))
+		return ae9_outfx_switch_set(codec, nid, *valp);
+
 	/* PE */
 	if (nid == PLAY_ENHANCEMENT) {
 		spec->effects_switch[nid - EFFECT_START_NID] = *valp;
-		if (ca0132_quirk(spec) == QUIRK_AE9)
-			spec->ae9_acm_pending_fx = true;	/* SBX light follows */
 		return ca0132_pe_switch_set(codec);
 	}
 
@@ -11094,6 +11144,16 @@ static bool ae9_fx_enabled(struct ca0132_spec *spec)
 	return spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] != 0;
 }
 
+/* The service worker consumes the LED request with its committed cache. */
+static void ae9_acm_sync_fx(struct ca0132_spec *spec)
+{
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (!READ_ONCE(spec->ae9_acm_pending_fx))
+		return;
+	WRITE_ONCE(spec->ae9_acm_pending_fx, false);
+	ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
+}
+
 /* The ACM's SBX button toggles Enable OutFX, like Windows does. */
 static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 {
@@ -11106,11 +11166,14 @@ static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 		codec_info(codec, "AE-9 ACM: SBX button long press (%d ms), ignored\n", ms);
 		return;
 	}
-	spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = !ae9_fx_enabled(spec);
-	codec_info(codec, "AE-9 ACM: SBX button (%d ms) -> OutFX %s\n", ms,
-		   ae9_fx_enabled(spec) ? "on" : "off");
-	ca0132_pe_switch_set(codec);
-	spec->ae9_acm_pending_fx = true;
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID],
+			   !ae9_fx_enabled(spec));
+		codec_info(codec, "AE-9 ACM: SBX button (%d ms) -> OutFX %s\n", ms,
+			   ae9_fx_enabled(spec) ? "on" : "off");
+		__ca0132_pe_switch_set(codec);
+		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
+	}
 	kctl = snd_hda_find_mixer_ctl(codec, "Enable OutFX Playback Switch");
 	if (kctl)
 		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
@@ -11492,7 +11555,8 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	    ae9_acm_cmd(spec, tlong1, sizeof(tlong1)) ||
 	    ae9_acm_cmd(spec, cmd05, sizeof(cmd05)))
 		return false;
-	ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));	/* SBX light = Enable OutFX */
+	scoped_guard(mutex, &spec->ae9_output_mutex)
+		ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
 	if (READ_ONCE(spec->ae9_acm_tx_failed) ||
 	    ae9_acm_cmd(spec, led, sizeof(led)))
 		return false;
@@ -11609,10 +11673,7 @@ static void ae9_acm_work_fn(struct work_struct *work)
 		ae9_acm_service_buttons(codec);
 		ae9_acm_service_knob_press(codec);
 	}
-	if (spec->ae9_acm_pending_fx) {
-		spec->ae9_acm_pending_fx = false;
-		ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
-	}
+	ae9_acm_sync_fx(spec);
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
 		goto out;
 	if (spec->ae9_acm_show_mode_ticks > 0) {
