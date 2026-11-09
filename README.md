@@ -51,6 +51,13 @@ A Clang-built kernel requires the corresponding LLVM toolchain. The build
 helper reads the target kernel configuration and respects explicit `CC` or
 `LLVM` settings.
 
+Automatic selection checks the compiler family and major version against the
+target configuration, trying the recorded GCC name, a versioned executable,
+then `gcc` or `clang`. Explicit compiler paths and wrappers are preserved
+without probing. For old DKMS forcing an unavailable bare `clang`, the helper
+can use matching `clang-N` and, when needed, `ld.lld-N` with compatible LLVM
+settings. This does not install tools or qualify another distribution kernel.
+
 ### 2. Obtain and install the firmware
 
 Install `curl`, `tar` and `innoextract` using your package manager.
