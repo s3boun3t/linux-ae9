@@ -2808,15 +2808,50 @@ static int dspio_free_dma_chan(struct hda_codec *codec, unsigned int dma_chan)
 }
 
 /*
+ * AE-9 ChipIO can return inconsistent data without reporting an error.
+ * Following 3xHelix's DBGCNTL guard, require three matching low control
+ * words; the upper word may change independently. Retry only mismatches.
+ */
+static int ae9_dsp_dbgcntl_read_stable(struct hda_codec *codec,
+				       unsigned int *reg)
+{
+	unsigned int v[3], attempt, i;
+	int err;
+
+	for (attempt = 0; attempt < 4; attempt++) {
+		for (i = 0; i < ARRAY_SIZE(v); i++) {
+			err = chipio_read(codec, DSP_DBGCNTL_INST_OFFSET,
+					  &v[i]);
+			if (err < 0)
+				return err;
+		}
+		if (!((v[0] ^ v[1]) & 0xffff) &&
+		    !((v[1] ^ v[2]) & 0xffff)) {
+			*reg = v[2];
+			return 0;
+		}
+	}
+
+	codec_warn(codec,
+		   "AE-9 DBGCNTL reads disagree (0x%08x 0x%08x 0x%08x); DSP restart skipped\n",
+		   v[0], v[1], v[2]);
+	return -EIO;
+}
+
+/*
  * (Re)start the DSP
  */
 static int dsp_set_run_state(struct hda_codec *codec)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int dbg_ctrl_reg;
 	unsigned int halt_state;
 	int err;
 
-	err = chipio_read(codec, DSP_DBGCNTL_INST_OFFSET, &dbg_ctrl_reg);
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		err = ae9_dsp_dbgcntl_read_stable(codec, &dbg_ctrl_reg);
+	else
+		err = chipio_read(codec, DSP_DBGCNTL_INST_OFFSET, &dbg_ctrl_reg);
 	if (err < 0)
 		return err;
 
