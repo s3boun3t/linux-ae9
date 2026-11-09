@@ -55,7 +55,14 @@ modules clean:
     def available(self, *names):
         for name in names:
             tool = self.bin / name
-            tool.write_text('#!/bin/sh\nexit 0\n')
+            family = 'clang' if name.startswith('clang') else 'gcc'
+            major = name.rsplit('-', 1)[1]
+            banner = (f'clang version {major}.0.0' if family == 'clang'
+                      else f'gcc (GCC) {major}.0.0')
+            tool.write_text('#!/bin/sh\ncase "$1" in\n'
+                            f'--version) echo "{banner}" ;;\n'
+                            f'-dumpfullversion) echo "{major}.0.0" ;;\n'
+                            'esac\n')
             tool.chmod(0o755)
 
     def run_helper(self, action='build', **variables):
