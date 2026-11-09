@@ -58,6 +58,14 @@ without probing. For old DKMS forcing an unavailable bare `clang`, the helper
 can use matching `clang-N` and, when needed, `ld.lld-N` with compatible LLVM
 settings. This does not install tools or qualify another distribution kernel.
 
+The build directory (`--kdir`) supplies the target configuration, release and
+symbols. API headers may live in a separate source directory, as on Debian:
+the helper recognizes a simple generated Makefile wrapper or accepts an
+explicit `--ksrc` path. It checks the source base version, including Ubuntu's
+version signature when present. Ambiguous wrappers are refused. `--ksrc`
+only selects API headers; it does not relocate extracted kernel Makefiles.
+Compilation and cleanup still run against `--kdir`.
+
 ### 2. Obtain and install the firmware
 
 Install `curl`, `tar` and `innoextract` using your package manager.
