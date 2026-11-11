@@ -7178,16 +7178,8 @@ static int ca0132_alt_input_source_info(struct snd_kcontrol *kcontrol,
 {
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
-	unsigned int items = ca0132_input_items(spec);
 
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
-	uinfo->count = 1;
-	uinfo->value.enumerated.items = items;
-	if (uinfo->value.enumerated.item >= items)
-		uinfo->value.enumerated.item = items - 1;
-	strscpy(uinfo->value.enumerated.name,
-		in_src_str[uinfo->value.enumerated.item]);
-	return 0;
+	return snd_ctl_enum_info(uinfo, 1, ca0132_input_items(spec), in_src_str);
 }
 
 static int ca0132_alt_input_source_get(struct snd_kcontrol *kcontrol,
@@ -7236,14 +7228,7 @@ static int ca0132_alt_input_source_put(struct snd_kcontrol *kcontrol,
 static int ca0132_alt_output_select_get_info(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_info *uinfo)
 {
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
-	uinfo->count = 1;
-	uinfo->value.enumerated.items = NUM_OF_OUTPUTS;
-	if (uinfo->value.enumerated.item >= NUM_OF_OUTPUTS)
-		uinfo->value.enumerated.item = NUM_OF_OUTPUTS - 1;
-	strscpy(uinfo->value.enumerated.name,
-			out_type_str[uinfo->value.enumerated.item]);
-	return 0;
+	return snd_ctl_enum_info(uinfo, 1, NUM_OF_OUTPUTS, out_type_str);
 }
 
 static int ca0132_alt_output_select_get(struct snd_kcontrol *kcontrol,
@@ -7396,14 +7381,8 @@ static const char *const out_svm_set_enum_str[3] = {"Normal", "Loud", "Night" };
 static int ca0132_alt_svm_setting_info(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_info *uinfo)
 {
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
-	uinfo->count = 1;
-	uinfo->value.enumerated.items = NUM_OF_SVM_SETTINGS;
-	if (uinfo->value.enumerated.item >= NUM_OF_SVM_SETTINGS)
-		uinfo->value.enumerated.item = NUM_OF_SVM_SETTINGS - 1;
-	strscpy(uinfo->value.enumerated.name,
-			out_svm_set_enum_str[uinfo->value.enumerated.item]);
-	return 0;
+	return snd_ctl_enum_info(uinfo, 1, NUM_OF_SVM_SETTINGS,
+				 out_svm_set_enum_str);
 }
 
 static int ca0132_alt_svm_setting_get(struct snd_kcontrol *kcontrol,
