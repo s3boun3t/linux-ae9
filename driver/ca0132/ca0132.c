@@ -9751,6 +9751,33 @@ static inline bool ae9_capture_blocked(struct hda_codec *codec)
 		return false;
 	return !(ae9_capture && ae9_mic);
 }
+
+static int ca0132_build_digital_pcm(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct hda_pcm *info;
+
+	if (!spec->dig_out && !(spec->dig_in && !ae9_capture_blocked(codec)))
+		return 0;
+
+	info = snd_hda_codec_pcm_new(codec, "CA0132 Digital");
+	if (!info)
+		return -ENOMEM;
+	info->pcm_type = HDA_PCM_TYPE_SPDIF;
+	if (spec->dig_out) {
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK] =
+			ca0132_pcm_digital_playback;
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dig_out;
+	}
+	if (spec->dig_in && !ae9_capture_blocked(codec)) {
+		info->stream[SNDRV_PCM_STREAM_CAPTURE] =
+			ca0132_pcm_digital_capture;
+		info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->dig_in;
+	}
+
+	return 0;
+}
+
 static int ca0132_build_pcms(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -9797,25 +9824,7 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->adcs[2];
 
 digital:
-	if (!spec->dig_out && !(spec->dig_in && !ae9_capture_blocked(codec)))
-		return 0;
-
-	info = snd_hda_codec_pcm_new(codec, "CA0132 Digital");
-	if (!info)
-		return -ENOMEM;
-	info->pcm_type = HDA_PCM_TYPE_SPDIF;
-	if (spec->dig_out) {
-		info->stream[SNDRV_PCM_STREAM_PLAYBACK] =
-			ca0132_pcm_digital_playback;
-		info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dig_out;
-	}
-	if (spec->dig_in && !ae9_capture_blocked(codec)) {
-		info->stream[SNDRV_PCM_STREAM_CAPTURE] =
-			ca0132_pcm_digital_capture;
-		info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->dig_in;
-	}
-
-	return 0;
+	return ca0132_build_digital_pcm(codec);
 }
 
 static int dbpro_build_pcms(struct hda_codec *codec)
@@ -9835,25 +9844,7 @@ static int dbpro_build_pcms(struct hda_codec *codec)
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->adcs[0];
 
 digital:
-	if (!spec->dig_out && !(spec->dig_in && !ae9_capture_blocked(codec)))
-		return 0;
-
-	info = snd_hda_codec_pcm_new(codec, "CA0132 Digital");
-	if (!info)
-		return -ENOMEM;
-	info->pcm_type = HDA_PCM_TYPE_SPDIF;
-	if (spec->dig_out) {
-		info->stream[SNDRV_PCM_STREAM_PLAYBACK] =
-			ca0132_pcm_digital_playback;
-		info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dig_out;
-	}
-	if (spec->dig_in && !ae9_capture_blocked(codec)) {
-		info->stream[SNDRV_PCM_STREAM_CAPTURE] =
-			ca0132_pcm_digital_capture;
-		info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->dig_in;
-	}
-
-	return 0;
+	return ca0132_build_digital_pcm(codec);
 }
 
 static void init_output(struct hda_codec *codec, hda_nid_t pin, hda_nid_t dac)
