@@ -6709,36 +6709,26 @@ static int ca0132_alt_slider_ctl_set(struct hda_codec *codec, hda_nid_t nid,
 			  const unsigned int *lookup, int idx)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int i = 0, err;
-	unsigned int y;
-	/*
-	 * For X_BASS, req 2 is actually crossover freq instead of
-	 * effect level
-	 */
-	if (nid == X_BASS)
-		y = 2;
-	else
-		y = 1;
+	int i, err;
+	unsigned int req_idx;
+
+	/* X-Bass level uses reqs[2], while its crossover uses reqs[1]. */
+	req_idx = nid == X_BASS ? 2 : 1;
 
 	CLASS(snd_hda_power, pm)(codec);
 	if (nid == XBASS_XOVER) {
-		for (i = 0; i < OUT_EFFECTS_COUNT; i++)
-			if (ca0132_effects[i].nid == X_BASS)
-				break;
-
-		err = dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
-				      ca0132_effects[i].reqs[1],
-				      &lookup[idx - 1], sizeof(unsigned int));
-	} else {
-		/* Find the actual effect structure */
-		for (i = 0; i < OUT_EFFECTS_COUNT; i++)
-			if (nid == ca0132_effects[i].nid)
-				break;
-
-		err = dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
-				      ca0132_effects[i].reqs[y],
-				      &lookup[idx], sizeof(unsigned int));
+		nid = X_BASS;
+		idx--;
 	}
+
+	/* Find the actual effect structure. */
+	for (i = 0; i < OUT_EFFECTS_COUNT; i++)
+		if (nid == ca0132_effects[i].nid)
+			break;
+
+	err = dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
+			      ca0132_effects[i].reqs[req_idx],
+			      &lookup[idx], sizeof(unsigned int));
 
 	return ca0132_quirk(spec) == QUIRK_AE9 ? err : 0;
 }
