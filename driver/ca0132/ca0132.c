@@ -1370,6 +1370,8 @@ struct ca0132_spec {
 	bool ae9_acm_mic_managed;	/* worker lifetime guard is registered */
 	/* Output selection, output-effect cache/DSP transactions and SBX LED. */
 	struct mutex ae9_output_mutex;
+	/* Protected by ae9_output_mutex; route complete, not an FX snapshot. */
+	bool ae9_output_applied;
 	/* Lock order: power reference, voice, control, SCP, ChipIO/memory. */
 	struct ae9_voice_state ae9_voice;
 	/* Serializes complete SCP messages and their shared reply state. */
@@ -4603,6 +4605,17 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 static void ae9_clock_diag_request(struct hda_codec *codec, unsigned int format);
 static void ae9_clock_diag_cancel(struct ca0132_spec *spec);
 
+static void ae9_output_invalidate(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	guard(mutex)(&spec->ae9_output_mutex);
+	spec->ae9_output_applied = false;
+	spec->ae9_acm_pending_mode = false;
+}
+
 static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			struct hda_codec *codec,
 			unsigned int stream_tag,
@@ -4610,6 +4623,18 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			struct snd_pcm_substream *substream)
 {
 	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		scoped_guard(mutex, &spec->ae9_output_mutex) {
+			if (spec->dsp_state != DSP_DOWNLOADED ||
+			    !spec->ae9_output_applied)
+				return -EIO;
+			snd_hda_codec_setup_stream(codec, spec->dacs[0],
+						   stream_tag, 0, format);
+		}
+		ae9_clock_diag_request(codec, format);
+		return 0;
+	}
 
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
 	ae9_clock_diag_request(codec, format);
@@ -5429,7 +5454,13 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 		}
 	}
 
-	chipio_set_control_param(codec, 0x0d, out_info->dac2port);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = ae9_control_param(codec, 0x0d, out_info->dac2port);
+		if (err < 0)
+			return err;
+	} else {
+		chipio_set_control_param(codec, 0x0d, out_info->dac2port);
+	}
 
 	if (out_info->has_chipio_write) {
 		err = chipio_write(codec, out_info->chipio_write_addr,
@@ -5457,17 +5488,27 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 	return 0;
 }
 
-static void ca0132_set_out_node_pincfg(struct hda_codec *codec, hda_nid_t nid,
-		bool out_enable, bool hp_enable)
+static int ca0132_set_out_node_pincfg(struct hda_codec *codec, hda_nid_t nid,
+				      bool out_enable, bool hp_enable)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int pin_ctl;
+	int err;
 
-	pin_ctl = snd_hda_codec_read(codec, nid, 0,
-			AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = snd_hdac_read(&codec->core, nid,
+				    AC_VERB_GET_PIN_WIDGET_CONTROL, 0, &pin_ctl);
+		if (err < 0)
+			return err;
+	} else {
+		pin_ctl = snd_hda_codec_read(codec, nid, 0,
+					     AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
+	}
 
 	pin_ctl = hp_enable ? pin_ctl | PIN_HP_AMP : pin_ctl & ~PIN_HP_AMP;
 	pin_ctl = out_enable ? pin_ctl | PIN_OUT : pin_ctl & ~PIN_OUT;
-	snd_hda_set_pin_ctl(codec, nid, pin_ctl);
+	err = snd_hda_set_pin_ctl(codec, nid, pin_ctl);
+	return ca0132_quirk(spec) == QUIRK_AE9 ? err : 0;
 }
 
 static int ae9_pm_error(struct hda_codec *codec, int err)
@@ -5501,6 +5542,14 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	/* Default Headphone is rear headphone */
 	hda_nid_t headphone_nid = spec->out_pins[1];
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		lockdep_assert_held(&spec->ae9_output_mutex);
+		spec->ae9_output_applied = false;
+		spec->ae9_acm_pending_mode = false;
+		if (spec->dsp_state != DSP_DOWNLOADED)
+			return -EIO;
+	}
+
 	codec_dbg(codec, "%s\n", __func__);
 
 	CLASS(snd_hda_power_pm, pm)(codec);
@@ -5527,9 +5576,6 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 			spec->cur_out_type = SPEAKER_OUT;
 	} else
 		spec->cur_out_type = spec->out_enum_val;
-	if (ca0132_quirk(spec) == QUIRK_AE9)
-		spec->ae9_acm_pending_mode = true;
-
 	outfx_set = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
 
 	/* Begin DSP output switch, mute DSP volume. */
@@ -5546,17 +5592,27 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 		codec_dbg(codec, "%s speaker\n", __func__);
 
 		/* Enable EAPD */
-		snd_hda_codec_write(codec, spec->out_pins[0], 0,
-			AC_VERB_SET_EAPD_BTLENABLE, 0x01);
+		err = snd_hda_codec_write(codec, spec->out_pins[0], 0,
+					  AC_VERB_SET_EAPD_BTLENABLE, 0x01);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 
 		/* Disable headphone node. */
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[1], 0, 0);
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[1], 0, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 		/* Set front L-R to output. */
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[0], 1, 0);
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[0], 1, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 		/* Set Center/LFE to output. */
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[2], 1, 0);
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[2], 1, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 		/* Set rear surround to output. */
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 1, 0);
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 1, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 
 		/*
 		 * Without PlayEnhancement being enabled, if we've got a 2.0
@@ -5575,13 +5631,21 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 		break;
 	case HEADPHONE_OUT:
 		codec_dbg(codec, "%s hp\n", __func__);
-		snd_hda_codec_write(codec, spec->out_pins[0], 0,
-			AC_VERB_SET_EAPD_BTLENABLE, 0x00);
+		err = snd_hda_codec_write(codec, spec->out_pins[0], 0,
+					  AC_VERB_SET_EAPD_BTLENABLE, 0x00);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 
 		/* Disable all speaker nodes. */
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[0], 0, 0);
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[2], 0, 0);
-		ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 0, 0);
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[0], 0, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[2], 0, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
+		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 0, 0);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 
 		/* enable headphone, either front or rear */
 		if (snd_hda_jack_detect(codec, spec->unsol_tag_front_hp))
@@ -5589,7 +5653,9 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 		else if (snd_hda_jack_detect(codec, spec->unsol_tag_hp))
 			headphone_nid = spec->out_pins[1];
 
-		ca0132_set_out_node_pincfg(codec, headphone_nid, 1, 1);
+		err = ca0132_set_out_node_pincfg(codec, headphone_nid, 1, 1);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 
 		if (outfx_set)
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
@@ -5634,18 +5700,31 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	if (err < 0)
 		return err;
 
+	/* AE-9 must finish every fallible route step before unmuting. */
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    spec->cur_out_type == SPEAKER_OUT) {
+		err = ca0132_alt_set_full_range_speaker(codec);
+		if (err < 0)
+			return err;
+	}
+
 	/* Unmute DSP now that we're done with output selection. */
 	err = dspio_set_uint_param(codec, 0x96,
 				   SPEAKER_TUNING_MUTE, FLOAT_ZERO);
 	if (err < 0)
 		return err;
 
-	if (spec->cur_out_type == SPEAKER_OUT) {
+	if (ca0132_quirk(spec) != QUIRK_AE9 &&
+	    spec->cur_out_type == SPEAKER_OUT) {
 		err = ca0132_alt_set_full_range_speaker(codec);
 		if (err < 0)
 			return err;
 	}
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		spec->ae9_output_applied = true;
+		spec->ae9_acm_pending_mode = true;
+	}
 	return 0;
 }
 
@@ -5659,8 +5738,10 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 
 	CLASS(snd_hda_power_pm, pm)(codec);
 	err = ae9_pm_error(codec, pm.err);
-	if (err < 0)
+	if (err < 0) {
+		ae9_output_invalidate(codec);
 		return err;
+	}
 	mutex_lock(&spec->ae9_output_mutex);
 	err = __ca0132_alt_select_out(codec);
 	mutex_unlock(&spec->ae9_output_mutex);
@@ -5672,7 +5753,6 @@ static int ae9_select_output_locked(struct hda_codec *codec, int output)
 	struct ca0132_spec *spec = codec->spec;
 	int old_output = spec->out_enum_val;
 	int old_type = spec->cur_out_type;
-	bool old_pending = spec->ae9_acm_pending_mode;
 	int err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
@@ -5681,7 +5761,6 @@ static int ae9_select_output_locked(struct hda_codec *codec, int output)
 	if (err < 0) {
 		spec->out_enum_val = old_output;
 		spec->cur_out_type = old_type;
-		spec->ae9_acm_pending_mode = old_pending;
 	}
 	return err;
 }
@@ -7222,10 +7301,15 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 		int err = 0;
 
 		CLASS(snd_hda_power_pm, pm)(codec);
+		err = ae9_pm_error(codec, pm.err);
+		if (err < 0) {
+			ae9_output_invalidate(codec);
+			return err;
+		}
 
 		mutex_lock(&spec->ae9_output_mutex);
 		auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
-		if (!auto_jack)
+		if (!auto_jack || !spec->ae9_output_applied)
 			err = ae9_select_output_locked(codec, sel);
 		else
 			spec->out_enum_val = sel;
@@ -7265,6 +7349,11 @@ static int ca0132_alt_speaker_channel_cfg_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		ucontrol->value.enumerated.item[0] = spec->channel_cfg_val;
+		return 0;
+	}
 	ucontrol->value.enumerated.item[0] = spec->channel_cfg_val;
 	return 0;
 }
@@ -7282,6 +7371,31 @@ static int ca0132_alt_speaker_channel_cfg_put(struct snd_kcontrol *kcontrol,
 
 	codec_dbg(codec, "ca0132_alt_speaker_channels: sel=%d, channels=%s\n",
 		    sel, speaker_channel_cfgs[sel].name);
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		int old, err;
+
+		CLASS(snd_hda_power_pm, pm)(codec);
+		err = ae9_pm_error(codec, pm.err);
+		if (err < 0) {
+			ae9_output_invalidate(codec);
+			return err;
+		}
+		guard(mutex)(&spec->ae9_output_mutex);
+		old = spec->channel_cfg_val;
+		if (old == sel && spec->ae9_output_applied)
+			return 0;
+		spec->channel_cfg_val = sel;
+		if (spec->cur_out_type == SPEAKER_OUT ||
+		    !spec->ae9_output_applied) {
+			err = ae9_select_output_locked(codec, spec->out_enum_val);
+			if (err < 0) {
+				spec->channel_cfg_val = old;
+				return err;
+			}
+		}
+		return 1;
+	}
 
 	spec->channel_cfg_val = sel;
 
@@ -7525,16 +7639,64 @@ static int ca0132_switch_get(struct snd_kcontrol *kcontrol,
 	}
 
 	if (nid == SPEAKER_FULL_RANGE_FRONT || nid == SPEAKER_FULL_RANGE_REAR) {
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			guard(mutex)(&spec->ae9_output_mutex);
+			*valp = spec->speaker_range_val[nid - SPEAKER_FULL_RANGE_FRONT];
+			return 0;
+		}
 		*valp = spec->speaker_range_val[nid - SPEAKER_FULL_RANGE_FRONT];
 		return 0;
 	}
 
 	if (nid == BASS_REDIRECTION) {
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			guard(mutex)(&spec->ae9_output_mutex);
+			*valp = spec->bass_redirection_val;
+			return 0;
+		}
 		*valp = spec->bass_redirection_val;
 		return 0;
 	}
 
 	return 0;
+}
+
+static int ae9_speaker_switch_put(struct hda_codec *codec, hda_nid_t nid,
+				  long value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned char *cache, old;
+	int err = 0;
+
+	if (nid != BASS_REDIRECTION && nid != SPEAKER_FULL_RANGE_FRONT &&
+	    nid != SPEAKER_FULL_RANGE_REAR)
+		return -EINVAL;
+	if (value != 0 && value != 1)
+		return -EINVAL;
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (nid == BASS_REDIRECTION)
+		cache = &spec->bass_redirection_val;
+	else
+		cache = &spec->speaker_range_val[nid - SPEAKER_FULL_RANGE_FRONT];
+	old = *cache;
+	if (old == value && spec->ae9_output_applied)
+		return 0;
+	*cache = value;
+	if (!spec->ae9_output_applied) {
+		err = ae9_select_output_locked(codec, spec->out_enum_val);
+	} else if (spec->cur_out_type == SPEAKER_OUT) {
+		if (nid == BASS_REDIRECTION)
+			err = ca0132_alt_surround_set_bass_redirection(codec, value);
+		else
+			err = ca0132_alt_set_full_range_speaker(codec);
+	}
+	if (err < 0) {
+		*cache = old;
+		spec->ae9_output_applied = false;
+		spec->ae9_acm_pending_mode = false;
+		return err;
+	}
+	return 1;
 }
 
 static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
@@ -7550,6 +7712,15 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
 		    nid, *valp);
 
 	CLASS(snd_hda_power, pm)(codec);
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    (nid == SPEAKER_FULL_RANGE_FRONT || nid == SPEAKER_FULL_RANGE_REAR ||
+	     nid == BASS_REDIRECTION)) {
+		if (pm.err < 0) {
+			ae9_output_invalidate(codec);
+			return pm.err;
+		}
+		return ae9_speaker_switch_put(codec, nid, *valp);
+	}
 	/* vnode */
 	if ((nid >= VNODE_START_NID) && (nid < VNODE_END_NID)) {
 		if (ch & 1) {
@@ -9230,7 +9401,15 @@ static int ae9_resume_routes(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	bool restore_input;
+	int err;
 
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		if (!spec->ae9_output_applied) {
+			err = __ca0132_alt_select_out(codec);
+			if (err < 0)
+				return err;
+		}
+	}
 	scoped_guard(mutex, &spec->ae9_voice.mutex)
 		restore_input = spec->ae9_voice.source_dirty ||
 				spec->ae9_voice.suspended;
@@ -12773,6 +12952,8 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 		return;
 	mutex_lock(&spec->ae9_output_mutex);
 	spec->ae9_acm_pending_mode = false;
+	if (!spec->ae9_output_applied || spec->dsp_state != DSP_DOWNLOADED)
+		goto out;
 	ae9_acm_apply_regs(spec);
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
 		goto out;
@@ -12817,7 +12998,14 @@ static void ae9_acm_update_headphone_jack(struct hda_codec *codec, int reg2)
 	spec->ae9_hp_jack_present = present;
 	codec_info(codec, "AE-9 ACM: headphone jack %s (reg2=%02x)\n",
 		   present ? "inserted" : "removed", reg2);
-	if (spec->out_enum_val == output && spec->cur_out_type == output)
+	err = ae9_pm_error(codec, pm.err);
+	if (err < 0) {
+		spec->ae9_output_applied = false;
+		spec->ae9_acm_pending_mode = false;
+		goto out;
+	}
+	if (spec->out_enum_val == output && spec->cur_out_type == output &&
+	    spec->ae9_output_applied)
 		goto out;
 
 	err = ae9_select_output_locked(codec, output);
@@ -12873,7 +13061,8 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 	}
 	mutex_lock(&spec->ae9_output_mutex);
 	hp = spec->cur_out_type == HEADPHONE_OUT;
-	if (!!(r2 & 0x40) != hp) {
+	if (spec->ae9_output_applied && spec->dsp_state == DSP_DOWNLOADED &&
+	    !!(r2 & 0x40) != hp) {
 		codec_info(codec, "AE-9 ACM: HP amp bit is %s but output is %s, re-applying\n",
 			   (r2 & 0x40) ? "on" : "off", hp ? "headphone" : "speakers");
 		ae9_acm_apply_regs(spec);
@@ -13872,6 +14061,7 @@ static void ae9_exit_chip(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 	int err, i;
 
+	ae9_output_invalidate(codec);
 	if (ca0132_quirk(spec) != QUIRK_AE9 || !spec->mem_base ||
 	    spec->dsp_state != DSP_DOWNLOADED)
 		return;
@@ -14540,6 +14730,7 @@ static int ae9_dsp_init_failed(struct hda_codec *codec, int err)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	ae9_output_invalidate(codec);
 	ae9_voice_suspend(codec);
 	spec->dsp_state = DSP_DOWNLOAD_FAILED;
 	spec->ae9_dsp_vol_zeroed = false;
@@ -14559,8 +14750,10 @@ static int ca0132_init(struct hda_codec *codec)
 	bool dsp_loaded;
 
 	if (ca0132_quirk(spec) == QUIRK_AE9 &&
-	    spec->dsp_state == DSP_DOWNLOAD_FAILED)
+	    spec->dsp_state == DSP_DOWNLOAD_FAILED) {
+		ae9_output_invalidate(codec);
 		return -EIO;
+	}
 
 	/*
 	 * If the DSP is already downloaded, and init has been entered again,
@@ -14585,6 +14778,7 @@ static int ca0132_init(struct hda_codec *codec)
 
 				err = ae9_pm_error(codec, retained_pm.err);
 				if (err < 0) {
+					ae9_output_invalidate(codec);
 					ae9_voice_suspend(codec);
 					return err;
 				}
@@ -14597,6 +14791,7 @@ static int ca0132_init(struct hda_codec *codec)
 		}
 	}
 
+	ae9_output_invalidate(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
 		ae9_voice_suspend(codec);
 	if (spec->dsp_state != DSP_DOWNLOAD_FAILED)
