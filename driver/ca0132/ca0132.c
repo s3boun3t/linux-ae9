@@ -8035,35 +8035,20 @@ static int ca0132_volume_info(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_info *uinfo)
 {
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
-	struct ca0132_spec *spec = codec->spec;
 	hda_nid_t nid = get_amp_nid(kcontrol);
 	int ch = get_amp_channels(kcontrol);
 	int dir = get_amp_direction(kcontrol);
 	unsigned long pval;
 	int err;
 
-	switch (nid) {
-	case VNID_SPK:
-		/* follow shared_out info */
-		nid = spec->shared_out_nid;
+	if (ca0132_is_vnode_effective(codec, nid, &nid)) {
 		scoped_guard(mutex, &codec->control_mutex) {
 			pval = kcontrol->private_value;
 			kcontrol->private_value = HDA_COMPOSE_AMP_VAL(nid, ch, 0, dir);
 			err = snd_hda_mixer_amp_volume_info(kcontrol, uinfo);
 			kcontrol->private_value = pval;
 		}
-		break;
-	case VNID_MIC:
-		/* follow shared_mic info */
-		nid = spec->shared_mic_nid;
-		scoped_guard(mutex, &codec->control_mutex) {
-			pval = kcontrol->private_value;
-			kcontrol->private_value = HDA_COMPOSE_AMP_VAL(nid, ch, 0, dir);
-			err = snd_hda_mixer_amp_volume_info(kcontrol, uinfo);
-			kcontrol->private_value = pval;
-		}
-		break;
-	default:
+	} else {
 		err = snd_hda_mixer_amp_volume_info(kcontrol, uinfo);
 	}
 	return err;
@@ -8179,35 +8164,20 @@ static int ca0132_volume_tlv(struct snd_kcontrol *kcontrol, int op_flag,
 			     unsigned int size, unsigned int __user *tlv)
 {
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
-	struct ca0132_spec *spec = codec->spec;
 	hda_nid_t nid = get_amp_nid(kcontrol);
 	int ch = get_amp_channels(kcontrol);
 	int dir = get_amp_direction(kcontrol);
 	unsigned long pval;
 	int err;
 
-	switch (nid) {
-	case VNID_SPK:
-		/* follow shared_out tlv */
-		nid = spec->shared_out_nid;
+	if (ca0132_is_vnode_effective(codec, nid, &nid)) {
 		scoped_guard(mutex, &codec->control_mutex) {
 			pval = kcontrol->private_value;
 			kcontrol->private_value = HDA_COMPOSE_AMP_VAL(nid, ch, 0, dir);
 			err = snd_hda_mixer_amp_tlv(kcontrol, op_flag, size, tlv);
 			kcontrol->private_value = pval;
 		}
-		break;
-	case VNID_MIC:
-		/* follow shared_mic tlv */
-		nid = spec->shared_mic_nid;
-		scoped_guard(mutex, &codec->control_mutex) {
-			pval = kcontrol->private_value;
-			kcontrol->private_value = HDA_COMPOSE_AMP_VAL(nid, ch, 0, dir);
-			err = snd_hda_mixer_amp_tlv(kcontrol, op_flag, size, tlv);
-			kcontrol->private_value = pval;
-		}
-		break;
-	default:
+	} else {
 		err = snd_hda_mixer_amp_tlv(kcontrol, op_flag, size, tlv);
 	}
 	return err;
