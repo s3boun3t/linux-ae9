@@ -29,6 +29,7 @@
 #include <asm/io.h>
 #include <sound/core.h>
 #include <sound/hda_codec.h>
+#include <sound/hda_regmap.h>
 #include "hda_local.h"
 #include "hda_auto_parser.h"
 #include "hda_jack.h"
@@ -1161,6 +1162,41 @@ enum dsp_download_state {
  * CA0132 specific
  */
 
+/* AE9_VOICE_TYPES_BEGIN */
+enum ae9_voice_setting {
+	AE9_VOICE_MASTER,
+	AE9_VOICE_NR,
+	AE9_VOICE_AEC,
+	AE9_VOICE_SVM,
+	AE9_VOICE_MICEQ,
+	AE9_VOICE_VOICEFX,
+	AE9_VOICE_SETTING_COUNT,
+	AE9_VOICE_FOCUS = AE9_VOICE_SETTING_COUNT,
+	AE9_VOICE_ACTIVE,
+};
+
+struct ae9_voice_config {
+	unsigned int value[AE9_VOICE_SETTING_COUNT];
+};
+
+struct ae9_voice_state {
+	/* Serializes desired/applied state, controls, PCM and power loss. */
+	struct mutex mutex;
+	struct ae9_voice_config desired;
+	struct ae9_voice_config applied;
+	bool applied_valid;
+	bool gain_valid;
+	bool route;
+	bool prepared;
+	bool touched;
+	bool suspended;
+	bool source_dirty;
+	unsigned int rate;
+	unsigned int format;
+};
+
+/* AE9_VOICE_TYPES_END */
+
 struct ca0132_spec {
 	const struct snd_kcontrol_new *mixers[5];
 	unsigned int num_mixers;
@@ -1334,6 +1370,10 @@ struct ca0132_spec {
 	bool ae9_acm_mic_managed;	/* worker lifetime guard is registered */
 	/* Output selection, output-effect cache/DSP transactions and SBX LED. */
 	struct mutex ae9_output_mutex;
+	/* Lock order: power reference, voice, control, SCP, ChipIO/memory. */
+	struct ae9_voice_state ae9_voice;
+	/* Serializes complete SCP messages and their shared reply state. */
+	struct mutex ae9_scp_mutex;
 	int ae9_acm_dead_ticks;		/* consecutive keepalive probes unanswered */
 	int ae9_acm_sel;		/* last module selector bits (items 5/6) */
 
@@ -1394,6 +1434,8 @@ enum {
 
 static void ae9_acm_display_changed(struct ca0132_spec *spec);
 static void ae9_acm_stop(struct ca0132_spec *spec, bool removing);
+static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source);
+static int ae9_voice_boost_put(struct hda_codec *codec, unsigned int boost);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -2282,8 +2324,10 @@ static int dspio_send(struct hda_codec *codec, unsigned int reg,
 /*
  * Wait for DSP to be ready for commands
  */
-static void dspio_write_wait(struct hda_codec *codec)
+static int dspio_write_wait(struct hda_codec *codec)
 {
+	struct ca0132_spec *spec = codec->spec;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
 	int status;
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 
@@ -2292,9 +2336,14 @@ static void dspio_write_wait(struct hda_codec *codec)
 						VENDOR_DSPIO_STATUS, 0);
 		if ((status == VENDOR_STATUS_DSPIO_OK) ||
 		    (status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY))
-			break;
+			return 0;
+		if (ae9 && status != VENDOR_STATUS_DSPIO_BUSY &&
+		    status != VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
+			return -EIO;
 		msleep(1);
 	} while (time_before(jiffies, timeout));
+
+	return ae9 ? -ETIMEDOUT : 0;
 }
 
 /*
@@ -2303,27 +2352,48 @@ static void dspio_write_wait(struct hda_codec *codec)
 static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 {
 	struct ca0132_spec *spec = codec->spec;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
+	unsigned long timeout;
 	int status;
 
-	dspio_write_wait(codec);
+	status = dspio_write_wait(codec);
+	if (status < 0)
+		return status;
 
 	guard(mutex)(&spec->chipio_mutex);
 	status = dspio_send(codec, VENDOR_DSPIO_SCP_WRITE_DATA_LOW,
 			    scp_data & 0xffff);
 	if (status < 0)
 		return status;
+	if (ae9 && status != VENDOR_STATUS_DSPIO_OK &&
+	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		return -EIO;
 
 	status = dspio_send(codec, VENDOR_DSPIO_SCP_WRITE_DATA_HIGH,
 				    scp_data >> 16);
 	if (status < 0)
 		return status;
+	if (ae9 && status != VENDOR_STATUS_DSPIO_OK &&
+	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		return -EIO;
 
-	/* OK, now check if the write itself has executed*/
-	status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
-				    VENDOR_DSPIO_STATUS, 0);
+	/* Never resend a word whose acceptance is uncertain. */
+	timeout = jiffies + msecs_to_jiffies(1000);
+	do {
+		status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
+					    VENDOR_DSPIO_STATUS, 0);
+		if (!ae9)
+			return status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL ?
+				-EIO : 0;
+		if (status == VENDOR_STATUS_DSPIO_OK ||
+		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+			return 0;
+		if (status != VENDOR_STATUS_DSPIO_BUSY)
+			return -EIO;
+		usleep_range(1000, 1500);
+	} while (time_before(jiffies, timeout));
 
-	return (status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL) ?
-			-EIO : 0;
+	return -ETIMEDOUT;
 }
 
 /*
@@ -2625,7 +2695,7 @@ static void ae9_dsp_log_first_error(struct hda_codec *codec, const char *stage,
 }
 
 /**
- * dspio_scp - Prepare and send the SCP message to DSP
+ * __dspio_scp - Prepare and send the SCP message to DSP
  * @codec: the HDA codec
  * @mod_id: ID of the DSP module to send the command
  * @src_id: ID of the source
@@ -2638,9 +2708,9 @@ static void ae9_dsp_log_first_error(struct hda_codec *codec, const char *stage,
  *
  * Returns zero or a negative error code.
  */
-static int dspio_scp(struct hda_codec *codec,
-		int mod_id, int src_id, int req, int dir, const void *data,
-		unsigned int len, void *reply, unsigned int *reply_len)
+static int __dspio_scp(struct hda_codec *codec,
+		       int mod_id, int src_id, int req, int dir, const void *data,
+		       unsigned int len, void *reply, unsigned int *reply_len)
 {
 	int status = 0;
 	struct scp_msg scp_send, scp_reply;
@@ -2730,6 +2800,22 @@ error:
 	ae9_dsp_log_first_error(codec, stage, status, &scp_send, len,
 				&scp_reply, ret_bytes);
 	return status;
+}
+
+static int dspio_scp(struct hda_codec *codec,
+		     int mod_id, int src_id, int req, int dir, const void *data,
+		     unsigned int len, void *reply, unsigned int *reply_len)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	/* SETs and GETs share the response-wait state, even across modules. */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_scp_mutex);
+		return __dspio_scp(codec, mod_id, src_id, req, dir, data,
+				  len, reply, reply_len);
+	}
+	return __dspio_scp(codec, mod_id, src_id, req, dir, data,
+			  len, reply, reply_len);
 }
 
 /*
@@ -6484,6 +6570,11 @@ static int ca0132_alt_mic_boost_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_voice.mutex);
+		ucontrol->value.enumerated.item[0] = spec->mic_boost_enum_val;
+		return 0;
+	}
 	ucontrol->value.enumerated.item[0] = spec->mic_boost_enum_val;
 	return 0;
 }
@@ -6495,6 +6586,9 @@ static int ca0132_alt_mic_boost_put(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	int sel = ucontrol->value.enumerated.item[0];
 	unsigned int items = MIC_BOOST_NUM_OF_STEPS;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return ae9_voice_boost_put(codec, sel);
 
 	if (sel >= items)
 		return 0;
@@ -6725,6 +6819,11 @@ static int ca0132_alt_input_source_get(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int items = ca0132_input_items(spec);
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_voice.mutex);
+		ucontrol->value.enumerated.item[0] = spec->in_enum_val;
+		return 0;
+	}
 	ucontrol->value.enumerated.item[0] = spec->in_enum_val;
 	if (ucontrol->value.enumerated.item[0] >= items)
 		ucontrol->value.enumerated.item[0] = items - 1;
@@ -6738,6 +6837,9 @@ static int ca0132_alt_input_source_put(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	int sel = ucontrol->value.enumerated.item[0];
 	unsigned int items = ca0132_input_items(spec);
+
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return ae9_voice_source_put(codec, sel);
 
 	if (sel >= items)
 		return 0;
@@ -7272,6 +7374,143 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	return err;
 }
 
+/* Caller holds the voice and control mutexes. Keep ALSA's existing curve. */
+static int ae9_mic_gain_send(struct hda_codec *codec, long left, long right)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	if (left < 0 || right < 0 ||
+	    left >= (long)ARRAY_SIZE(float_vol_db_lookup) ||
+	    right >= (long)ARRAY_SIZE(float_vol_db_lookup))
+		return -EINVAL;
+	if (spec->dsp_state != DSP_DOWNLOADED || spec->ae9_voice.suspended)
+		return -EIO;
+
+	err = dspio_set_uint_param(codec, 0x37, 0x02,
+				   float_vol_db_lookup[left]);
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x37, 0x03,
+				   float_vol_db_lookup[right]);
+	if (err < 0)
+		return err;
+	return dspio_set_uint_param(codec, 0x37, 0x01, FLOAT_ZERO);
+}
+
+/* Caller holds voice/control; repair both channels despite a stale AMP cache. */
+static int ae9_mic_gain_adc(struct hda_codec *codec, long left, long right)
+{
+	const long gains[] = { left, right };
+	unsigned int caps, reg, value, channel;
+	int err;
+
+	caps = query_amp_caps(codec, 0x07, HDA_INPUT);
+	for (channel = 0; channel < ARRAY_SIZE(gains); channel++) {
+		reg = snd_hdac_regmap_encode_amp(0x07, channel, HDA_INPUT, 0);
+		/* Match the standard AMP helper's min-volume mute encoding. */
+		if ((caps & (AC_AMPCAP_MUTE | AC_AMPCAP_MIN_MUTE)) ==
+		    AC_AMPCAP_MIN_MUTE)
+			reg |= AC_AMP_FAKE_MUTE;
+		err = snd_hdac_regmap_read_raw(&codec->core, reg, &value);
+		if (err < 0)
+			return err;
+		value = (value & HDA_AMP_MUTE) | (unsigned int)gains[channel];
+		err = snd_hdac_regmap_write_raw(&codec->core, reg, value);
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}
+
+/* Caller holds the voice mutex; init/resume may have reset the ADC gains. */
+static int ae9_mic_gain_restore(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	unsigned int idx = VNID_MIC - VNODE_START_NID;
+	int err;
+
+	if (spec->dsp_state != DSP_DOWNLOADED || voice->suspended) {
+		voice->gain_valid = false;
+		return -EIO;
+	}
+	if (voice->gain_valid)
+		return 0;
+	guard(mutex)(&codec->control_mutex);
+	err = ae9_mic_gain_send(codec, spec->vnode_lvol[idx],
+				spec->vnode_rvol[idx]);
+	if (err < 0)
+		return err;
+	/* Preserve the separate Capture Switch mute while repairing L/R. */
+	err = ae9_mic_gain_adc(codec, spec->vnode_lvol[idx],
+			       spec->vnode_rvol[idx]);
+	if (err < 0)
+		return err;
+	voice->gain_valid = true;
+	return 0;
+}
+
+static int ae9_mic_volume_put(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	unsigned int idx = VNID_MIC - VNODE_START_NID;
+	long *values = ucontrol->value.integer.value;
+	long left, right;
+	int channels = get_amp_channels(kcontrol);
+	bool repair;
+	int err;
+
+	CLASS(snd_hda_power, pm)(codec);
+	if (pm.err < 0) {
+		guard(mutex)(&voice->mutex);
+		voice->gain_valid = false;
+		return pm.err;
+	}
+	guard(mutex)(&voice->mutex);
+	left = spec->vnode_lvol[idx];
+	right = spec->vnode_rvol[idx];
+	if (channels & 1)
+		left = *values++;
+	if (channels & 2)
+		right = *values;
+	if (!channels || channels & ~3)
+		return -EINVAL;
+	if (left < 0 || right < 0 ||
+	    left >= (long)ARRAY_SIZE(float_vol_db_lookup) ||
+	    right >= (long)ARRAY_SIZE(float_vol_db_lookup))
+		return -EINVAL;
+	if (spec->dsp_state != DSP_DOWNLOADED || voice->suspended) {
+		voice->gain_valid = false;
+		return -EIO;
+	}
+	if (voice->gain_valid && left == spec->vnode_lvol[idx] &&
+	    right == spec->vnode_rvol[idx])
+		return 0;
+	/* Any partial DSP or HDA application must be repaired before capture. */
+	repair = !voice->gain_valid;
+	voice->gain_valid = false;
+	guard(mutex)(&codec->control_mutex);
+	err = ae9_mic_gain_send(codec, left, right);
+	if (err < 0)
+		return err;
+	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
+	if (err < 0)
+		return err;
+	if (repair) {
+		err = ae9_mic_gain_adc(codec, left, right);
+		if (err < 0)
+			return err;
+	}
+	spec->vnode_lvol[idx] = left;
+	spec->vnode_rvol[idx] = right;
+	voice->gain_valid = true;
+	return 1;
+}
+
 static void ca0132_alt_dsp_volume_put(struct hda_codec *codec, hda_nid_t nid)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -7427,6 +7666,8 @@ static int ca0132_alt_volume_put(struct snd_kcontrol *kcontrol,
 
 	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_SPK)
 		return ae9_master_apply(kcontrol, ucontrol);
+	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_MIC)
+		return ae9_mic_volume_put(kcontrol, ucontrol);
 
 	/* store the left and right volume */
 	if (ch & 1) {
@@ -7974,6 +8215,750 @@ static int ae9_add_acm_mic_jack(struct hda_codec *codec)
 	return 0;
 }
 
+/* AE9_VOICE_BEGIN */
+/*
+ * AE-9 voice processing uses 16 kHz DSP connections and a 48 kHz host PCM.
+ * Keep its desired controls separate from the legacy CrystalVoice switches:
+ * that path changes live stream rates and restarts DSP streams 3/4.
+ * The initial raw path stays unchanged until this feature is first used.
+ */
+/* Preset gains from Creative's VoiceEq data, documented by 3xHelix. */
+static const struct ae9_miceq_preset {
+	const char *name;
+	s8 db[8];
+} ae9_miceq_presets[] = {
+	{ "Off", { 0, 0, 0, 0, 0, 0, 0, 0 } },
+	{ "Preset 1 - Reduce bass and harshness",
+	  { -3, -4, 0, 2, 3, -3, 4, 5 } },
+	{ "Preset 2 - Improve vocal clarity",
+	  { -3, -4, 0, 2, 4, -2, 2, 4 } },
+	{ "Preset 3 - Reduce harshness",
+	  { -2, -3, 3, 4, 4, -4, 3, 2 } },
+	{ "Preset 4 - Reduce bass",
+	  { -3, -5, 0, 4, 4, -3, 0, 0 } },
+	{ "Preset 5 - Improve vocal",
+	  { -2, -3, 2, 4, 4, 0, -3, 2 } },
+	{ "Preset 6 - Improve clarity",
+	  { -5, -4, -2, 0, 3, 4, 6, 7 } },
+	{ "Preset 7 - Improve bass and clarity",
+	  { 0, 3, -2, -4, -4, -2, 5, 7 } },
+	{ "Preset 8 - Improve vocal and clarity",
+	  { 0, 0, 2, 2, 3, -4, 2, 4 } },
+	{ "Preset 9 - Reduce harshness and improve clarity",
+	  { 0, 0, 2, 2, -2, 0, -4, 4 } },
+	{ "Preset 10 - Improve clarity",
+	  { 0, 2, -2, 0, 3, 5, 6, 5 } },
+	{ "Preset DM-1 - Improve vocal and clarity",
+	  { 0, 8, 0, 12, 12, 4, 8, 10 } },
+};
+
+static bool ae9_voice_wanted(const struct ae9_voice_config *cfg,
+			     unsigned int source)
+{
+	unsigned int i;
+
+	if (!cfg->value[AE9_VOICE_MASTER] || source == REAR_LINE_IN)
+		return false;
+	for (i = AE9_VOICE_NR; i < AE9_VOICE_SETTING_COUNT; i++) {
+		if (cfg->value[i])
+			return true;
+	}
+	return false;
+}
+
+/* Small, integral preset gains encoded as IEEE-754, without kernel FPU. */
+static u32 ae9_voice_db(int db)
+{
+	static const u32 magnitude[] = {
+		0x00000000, 0x3f800000, 0x40000000, 0x40400000,
+		0x40800000, 0x40a00000, 0x40c00000, 0x40e00000,
+		0x41000000, 0x41100000, 0x41200000, 0x41300000,
+		0x41400000,
+	};
+
+	if (db < -12 || db > 12)
+		return 0;
+	return db < 0 ? magnitude[-db] | 0x80000000 : magnitude[db];
+}
+
+static int ae9_voice_set(struct hda_codec *codec, int mid, int req, u32 val)
+{
+	int err = dspio_set_uint_param(codec, mid, req, val);
+
+	/* Captured Windows pacing avoids bursts of multi-value presets. */
+	usleep_range(2000, 3000);
+	return err;
+}
+
+/* Caller holds chipio_mutex. Check the transport, not firmware semantics. */
+static int ae9_voice_param_locked(struct hda_codec *codec,
+				  unsigned int id, unsigned int value)
+{
+	int err;
+
+	err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+	if (err < 0)
+		return err;
+	if (id < 32 && value < 8) {
+		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+					  VENDOR_CHIPIO_PARAM_SET,
+					  (value << 5) | id);
+	} else {
+		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+					  VENDOR_CHIPIO_PARAM_EX_ID_SET, id);
+		if (err < 0)
+			return err;
+		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+					  VENDOR_CHIPIO_PARAM_EX_VALUE_SET,
+					  value);
+	}
+	if (err < 0)
+		return err;
+	return chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+}
+
+static int ae9_voice_connections(struct hda_codec *codec, unsigned int rate)
+{
+	struct ca0132_spec *spec = codec->spec;
+	static const unsigned int points[] = {
+		MEM_CONNID_MICIN1, MEM_CONNID_MICOUT1,
+	};
+	unsigned int i;
+	int err;
+
+	/* Keep point selection and its rate atomic, including both channels. */
+	guard(mutex)(&spec->chipio_mutex);
+	for (i = 0; i < ARRAY_SIZE(points); i++) {
+		err = ae9_voice_param_locked(codec,
+					     CONTROL_PARAM_CONN_POINT_ID, points[i]);
+		if (err < 0)
+			return err;
+		err = ae9_voice_param_locked(codec,
+					     CONTROL_PARAM_CONN_POINT_SAMPLE_RATE, rate);
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}
+
+static int ae9_voice_vip(struct hda_codec *codec, bool on)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->chipio_mutex);
+	return ae9_voice_param_locked(codec, CONTROL_PARAM_VIP_SOURCE, on);
+}
+
+static int ae9_voice_status(struct hda_codec *codec)
+{
+	u32 status;
+	unsigned int size = sizeof(status);
+	int err;
+
+	err = dspio_scp(codec, 0x80, 0x20, 0x3d, SCP_GET, NULL, 0,
+			&status, &size);
+	if (err < 0)
+		return err;
+	return size == sizeof(status) ? 0 : -EIO;
+}
+
+static int ae9_voice_apply_locked(struct hda_codec *codec,
+				  const struct ae9_voice_config *cfg)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	struct ae9_voice_config effective = *cfg;
+	static const struct {
+		unsigned int setting;
+		int mid;
+		int req;
+	} switches[] = {
+		{ AE9_VOICE_NR, 0x95, 0x04 },
+		{ AE9_VOICE_NR, 0x47, 0x00 },
+		{ AE9_VOICE_AEC, 0x95, 0x00 },
+		{ AE9_VOICE_SVM, 0x95, 0x2c },
+	};
+	unsigned int i, setting, preset;
+	bool valid = voice->applied_valid;
+	int err;
+
+	if (cfg->value[AE9_VOICE_MICEQ] >= ARRAY_SIZE(ae9_miceq_presets) ||
+	    cfg->value[AE9_VOICE_VOICEFX] >= ARRAY_SIZE(ca0132_voicefx_presets))
+		return -EINVAL;
+	if (spec->dsp_state != DSP_DOWNLOADED || voice->suspended)
+		return -EIO;
+	if (!ae9_voice_wanted(cfg, spec->in_enum_val))
+		memset(&effective, 0, sizeof(effective));
+	voice->touched = true;
+	preset = effective.value[AE9_VOICE_VOICEFX];
+	if (!valid || preset != voice->applied.value[AE9_VOICE_VOICEFX]) {
+		for (i = 0; i < (preset ? VOICEFX_MAX_PARAM_COUNT : 1); i++) {
+			err = ae9_voice_set(codec, 0x95, 0x0a + i,
+					    ca0132_voicefx_presets[preset].vals[i]);
+			if (err < 0)
+				goto fail;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(switches); i++) {
+		setting = switches[i].setting;
+		if (valid && effective.value[setting] ==
+		    voice->applied.value[setting])
+			continue;
+		err = ae9_voice_set(codec, switches[i].mid, switches[i].req,
+				    effective.value[setting] ? FLOAT_ONE : FLOAT_ZERO);
+		if (err < 0)
+			goto fail;
+	}
+	preset = effective.value[AE9_VOICE_MICEQ];
+	if (!valid || preset != voice->applied.value[AE9_VOICE_MICEQ]) {
+		err = ae9_voice_set(codec, 0x95, 0x13,
+				    preset ? FLOAT_ONE : FLOAT_ZERO);
+		if (err < 0)
+			goto fail;
+		if (preset) {
+			for (i = 0; i < 8; i++) {
+				err = ae9_voice_set(codec, 0x95, 0x14 + i,
+						    ae9_voice_db(ae9_miceq_presets[preset].db[i]));
+				if (err < 0)
+					goto fail;
+			}
+			if (!valid || !voice->applied.value[AE9_VOICE_MICEQ]) {
+				/* Frequencies and widths, Windows trace 7795-7810. */
+				static const u32 bands[] = {
+					0x42780000, 0x42fa0000, 0x437a0000, 0x43fa0000,
+					0x447a0000, 0x44fa0000, 0x457a0000, 0x45bb8000,
+					0x42300000, 0x42b00000, 0x43300000, 0x43b08000,
+					0x4430c000, 0x44b0c000, 0x4530c000, 0x44fa0000,
+				};
+
+				for (i = 0; i < ARRAY_SIZE(bands); i++) {
+					err = ae9_voice_set(codec, 0x95, 0x1c + i,
+							    bands[i]);
+					if (err < 0)
+						goto fail;
+				}
+			}
+		}
+	}
+	voice->applied = effective;
+	voice->applied_valid = true;
+	return 0;
+fail:
+	voice->applied_valid = false;
+	return err;
+}
+
+/* Caller holds the voice mutex; never change DSP streams 3/4 here. */
+static int ae9_voice_route_locked(struct hda_codec *codec, bool on)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	int err;
+
+	voice->touched = true;
+	if (on) {
+		err = ae9_voice_connections(codec, SR_16_000);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_set(codec, 0x80, 0x00, FLOAT_ONE);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_set(codec, 0x80, 0x05, FLOAT_ONE);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_status(codec);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_vip(codec, true);
+		if (err < 0)
+			goto fail;
+		/* Windows binds 51-66 ms later in the captures cited by 3xHelix. */
+		msleep(60);
+	} else {
+		err = ae9_voice_vip(codec, false);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_set(codec, 0x80, 0x05, FLOAT_ZERO);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_status(codec);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_connections(codec, SR_16_000);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_set(codec, 0x80, 0x00, FLOAT_ONE);
+		if (err < 0)
+			goto fail;
+	}
+	voice->route = on;
+	return 0;
+fail:
+	voice->applied_valid = false;
+	return err;
+}
+
+static int ae9_voice_raw_locked(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_config off = { };
+	int err;
+
+	err = ae9_voice_apply_locked(codec, &off);
+	if (err < 0)
+		return err;
+	err = ae9_voice_connections(codec, SR_96_000);
+	if (err < 0)
+		goto fail;
+	/* Restore the AE-9 raw mic mode captured at Windows bring-up. */
+	err = ae9_voice_set(codec, 0x80, 0x00,
+			    spec->in_enum_val == REAR_LINE_IN ? FLOAT_ZERO : FLOAT_THREE);
+	if (err < 0)
+		goto fail;
+	return 0;
+fail:
+	spec->ae9_voice.applied_valid = false;
+	return err;
+}
+
+static int ae9_voice_update(struct hda_codec *codec,
+			    unsigned int setting, unsigned int value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	struct ae9_voice_config next;
+	unsigned int limit;
+	int err;
+
+	if (setting == AE9_VOICE_FOCUS)
+		return value ? -EOPNOTSUPP : 0;
+	if (setting >= AE9_VOICE_SETTING_COUNT)
+		return -EINVAL;
+	limit = setting == AE9_VOICE_MICEQ ? ARRAY_SIZE(ae9_miceq_presets) :
+		setting == AE9_VOICE_VOICEFX ? ARRAY_SIZE(ca0132_voicefx_presets) : 2;
+	if (value >= limit)
+		return -EINVAL;
+	guard(mutex)(&voice->mutex);
+	next = voice->desired;
+	next.value[setting] = value;
+	if (voice->prepared &&
+	    ae9_voice_wanted(&next, spec->in_enum_val) !=
+	    ae9_voice_wanted(&voice->desired, spec->in_enum_val))
+		return -EBUSY;
+	if (value == voice->desired.value[setting] &&
+	    (!voice->prepared || !voice->route || voice->applied_valid))
+		return 0;
+	if (voice->prepared && voice->route) {
+		err = ae9_voice_apply_locked(codec, &next);
+		if (err < 0)
+			return err;
+	}
+	voice->desired = next;
+	return 1;
+}
+
+static int ae9_voice_capture_open(struct hda_pcm_stream *hinfo,
+				  struct hda_codec *codec,
+				  struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_voice.mutex);
+	if (ae9_voice_wanted(&spec->ae9_voice.desired, spec->in_enum_val))
+		return snd_pcm_hw_constraint_single(substream->runtime,
+					SNDRV_PCM_HW_PARAM_RATE, 48000);
+	return 0;
+}
+
+static int ae9_voice_cleanup_locked(struct hda_pcm_stream *hinfo,
+				    struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	int err = 0;
+
+	if (!voice->prepared)
+		return 0;
+	snd_hda_codec_cleanup_stream(codec, hinfo->nid);
+	voice->prepared = false;
+	voice->rate = 0;
+	voice->format = 0;
+	if (voice->suspended || spec->dsp_state != DSP_DOWNLOADED) {
+		voice->route = false;
+		voice->applied_valid = false;
+		return 0;
+	}
+	if (voice->route || (voice->touched && !voice->applied_valid)) {
+		/* Windows unbinds the ADC before removing the voice processor. */
+		msleep(30);
+		err = ae9_voice_route_locked(codec, false);
+	}
+	return err;
+}
+
+static int ae9_voice_set_format(struct hda_codec *codec, hda_nid_t nid,
+				unsigned int format)
+{
+	unsigned int actual;
+	int err;
+
+	/* Program the rate while unbound, before the DSP's voice route-in. */
+	err = snd_hda_codec_write(codec, nid, 0, AC_VERB_SET_STREAM_FORMAT,
+				  format);
+	if (err < 0)
+		return err;
+	actual = snd_hda_codec_read(codec, nid, 0, AC_VERB_GET_STREAM_FORMAT, 0);
+	return actual == format ? 0 : -EIO;
+}
+
+static int ae9_voice_capture_prepare(struct hda_pcm_stream *hinfo,
+				     struct hda_codec *codec,
+				     unsigned int stream_tag,
+				     unsigned int format,
+				     struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	bool want;
+	int err, recovery;
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (pm.err < 0) {
+		guard(mutex)(&voice->mutex);
+		voice->gain_valid = false;
+		return pm.err;
+	}
+	guard(mutex)(&voice->mutex);
+	want = ae9_voice_wanted(&voice->desired, spec->in_enum_val);
+	/* Recheck after open/hw_params: controls may have changed meanwhile. */
+	if (want && (substream->runtime->rate != 48000 ||
+		     (format & (AC_FMT_BASE_44K | AC_FMT_MULT_MASK |
+				AC_FMT_DIV_MASK))))
+		return -EINVAL;
+	if (spec->dsp_state != DSP_DOWNLOADED || voice->suspended)
+		return -EIO;
+	if (voice->source_dirty) {
+		err = ca0132_alt_select_in(codec);
+		if (err < 0)
+			return err;
+		voice->source_dirty = false;
+		voice->applied_valid = false;
+		voice->route = false;
+	}
+	err = ae9_voice_cleanup_locked(hinfo, codec);
+	if (err < 0)
+		return err;
+	/* An interrupted route needs a successful reset before another bind. */
+	if (voice->touched && !voice->applied_valid) {
+		err = ae9_voice_route_locked(codec, false);
+		if (err < 0)
+			return err;
+		err = ae9_voice_raw_locked(codec);
+		if (err < 0)
+			return err;
+	}
+	err = ae9_mic_gain_restore(codec);
+	if (err < 0)
+		goto fail;
+	if (want) {
+		err = ae9_voice_apply_locked(codec, &voice->desired);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_set_format(codec, hinfo->nid, format);
+		if (err < 0)
+			goto fail;
+		err = ae9_voice_route_locked(codec, true);
+		if (err < 0)
+			goto fail;
+	} else if (voice->touched) {
+		err = ae9_voice_raw_locked(codec);
+		if (err < 0)
+			goto fail;
+	}
+	snd_hda_codec_setup_stream(codec, hinfo->nid, stream_tag, 0, format);
+	voice->prepared = true;
+	voice->rate = substream->runtime->rate;
+	voice->format = format;
+	return 0;
+fail:
+	/* No ADC bind on failure. Keep the original error and invalidate cache. */
+	recovery = ae9_voice_route_locked(codec, false);
+	if (!recovery)
+		recovery = ae9_voice_raw_locked(codec);
+	voice->applied_valid = false;
+	if (recovery < 0)
+		codec_warn(codec, "AE-9: voice route recovery failed: %d\n", recovery);
+	return err;
+}
+
+static int ae9_voice_capture_cleanup(struct hda_pcm_stream *hinfo,
+				     struct hda_codec *codec,
+				     struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	guard(mutex)(&voice->mutex);
+	if (pm.err < 0) {
+		voice->prepared = false;
+		voice->rate = 0;
+		voice->format = 0;
+		voice->applied_valid = false;
+		voice->gain_valid = false;
+		return pm.err;
+	}
+	return ae9_voice_cleanup_locked(hinfo, codec);
+}
+
+static int ae9_voice_capture_close(struct hda_pcm_stream *hinfo,
+				   struct hda_codec *codec,
+				   struct snd_pcm_substream *substream)
+{
+	return ae9_voice_capture_cleanup(hinfo, codec, substream);
+}
+
+static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	unsigned int old;
+	int err;
+
+	if (source >= ca0132_input_items(spec))
+		return -EINVAL;
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (pm.err < 0)
+		return pm.err;
+	guard(mutex)(&voice->mutex);
+	if (source == spec->in_enum_val && !voice->source_dirty)
+		return 0;
+	if (voice->prepared)
+		return -EBUSY;
+	if (voice->suspended || spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
+	old = spec->in_enum_val;
+	spec->in_enum_val = source;
+	/* This legacy source selection is allowed only with the ADC idle. */
+	err = ca0132_alt_select_in(codec);
+	voice->applied_valid = false;
+	voice->route = false;
+	if (!err && voice->touched)
+		err = ae9_voice_raw_locked(codec);
+	if (err < 0) {
+		spec->in_enum_val = old;
+		spec->cur_mic_type = old;
+		/* Re-select the old mux before any later PCM can bind. */
+		voice->source_dirty = true;
+		return err;
+	}
+	voice->source_dirty = false;
+	return 1;
+}
+
+static int ae9_voice_boost_put(struct hda_codec *codec, unsigned int boost)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	if (boost >= MIC_BOOST_NUM_OF_STEPS)
+		return -EINVAL;
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (pm.err < 0)
+		return pm.err;
+	guard(mutex)(&spec->ae9_voice.mutex);
+	if (boost == spec->mic_boost_enum_val)
+		return 0;
+	if (spec->ae9_voice.suspended)
+		return -EIO;
+	if (spec->in_enum_val != REAR_LINE_IN) {
+		err = ca0132_alt_mic_boost_set(codec, boost);
+		if (err < 0)
+			return err;
+	}
+	spec->mic_boost_enum_val = boost;
+	return 1;
+}
+
+static int ae9_voice_restore(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	int err;
+
+	guard(mutex)(&voice->mutex);
+	voice->applied_valid = false;
+	voice->route = false;
+	voice->suspended = false;
+	voice->gain_valid = false;
+	if (spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
+	if (ae9_mic) {
+		err = ae9_mic_gain_restore(codec);
+		if (err < 0)
+			return err;
+	}
+	if (voice->prepared &&
+	    ae9_voice_wanted(&voice->desired, spec->in_enum_val)) {
+		if (voice->rate != 48000)
+			return -EINVAL;
+		err = ae9_voice_apply_locked(codec, &voice->desired);
+		if (err < 0)
+			return err;
+		err = ae9_voice_set_format(codec, spec->adcs[0], voice->format);
+		if (err < 0) {
+			voice->applied_valid = false;
+			return err;
+		}
+		return ae9_voice_route_locked(codec, true);
+	}
+	/* Preserve initial raw bring-up until this feature has been used. */
+	if (voice->touched)
+		return ae9_voice_raw_locked(codec);
+	return 0;
+}
+
+static int ae9_voice_quiesce(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	int err = 0;
+
+	guard(mutex)(&voice->mutex);
+	voice->gain_valid = false;
+	if (voice->suspended)
+		return 0;
+	if (voice->touched && spec->dsp_state == DSP_DOWNLOADED) {
+		if (voice->prepared)
+			snd_hda_codec_cleanup_stream(codec, spec->adcs[0]);
+		if (voice->route || !voice->applied_valid) {
+			msleep(30);
+			err = ae9_voice_route_locked(codec, false);
+		}
+		if (!err)
+			err = ae9_voice_raw_locked(codec);
+	}
+	/* Preserve the logical PCM setup for resume, even after a failed exit. */
+	voice->suspended = true;
+	voice->route = false;
+	voice->applied_valid = false;
+	return err;
+}
+
+static void ae9_voice_suspend(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+
+	guard(mutex)(&voice->mutex);
+	/* ALSA may retain a prepared PCM across suspend; keep its rate. */
+	voice->suspended = true;
+	voice->applied_valid = false;
+	voice->route = false;
+	voice->gain_valid = false;
+}
+
+static int ae9_voice_info(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_info *uinfo)
+{
+	const char *names[ARRAY_SIZE(ca0132_voicefx_presets)];
+	unsigned int i, count;
+
+	if (kcontrol->private_value == AE9_VOICE_MICEQ) {
+		count = ARRAY_SIZE(ae9_miceq_presets);
+		for (i = 0; i < count; i++)
+			names[i] = ae9_miceq_presets[i].name;
+	} else if (kcontrol->private_value == AE9_VOICE_VOICEFX) {
+		count = ARRAY_SIZE(ca0132_voicefx_presets);
+		for (i = 0; i < count; i++)
+			names[i] = ca0132_voicefx_presets[i].name;
+	} else {
+		return snd_ctl_boolean_mono_info(kcontrol, uinfo);
+	}
+	return snd_ctl_enum_info(uinfo, 1, count, names);
+}
+
+static int ae9_voice_get(struct snd_kcontrol *kcontrol,
+			 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	unsigned int setting = kcontrol->private_value;
+	unsigned int value;
+
+	guard(mutex)(&voice->mutex);
+	if (setting == AE9_VOICE_ACTIVE)
+		value = voice->prepared && voice->route &&
+			voice->applied_valid && voice->gain_valid &&
+			!voice->suspended && spec->dsp_state == DSP_DOWNLOADED;
+	else if (setting == AE9_VOICE_FOCUS)
+		value = 0;
+	else if (setting < AE9_VOICE_SETTING_COUNT)
+		value = voice->desired.value[setting];
+	else
+		return -EINVAL;
+	if (setting == AE9_VOICE_MICEQ || setting == AE9_VOICE_VOICEFX)
+		ucontrol->value.enumerated.item[0] = value;
+	else
+		ucontrol->value.integer.value[0] = value;
+	return 0;
+}
+
+static int ae9_voice_put(struct snd_kcontrol *kcontrol,
+			 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	unsigned int setting = kcontrol->private_value;
+	unsigned int value;
+
+	if (setting == AE9_VOICE_MICEQ || setting == AE9_VOICE_VOICEFX) {
+		value = ucontrol->value.enumerated.item[0];
+	} else {
+		if (ucontrol->value.integer.value[0] < 0 ||
+		    ucontrol->value.integer.value[0] > 1)
+			return -EINVAL;
+		value = ucontrol->value.integer.value[0];
+	}
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (pm.err < 0)
+		return pm.err;
+	return ae9_voice_update(codec, setting, value);
+}
+
+#define AE9_VOICE_CTL(label, setting) { \
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+	.name = label, \
+	.info = ae9_voice_info, \
+	.get = ae9_voice_get, \
+	.put = ae9_voice_put, \
+	.private_value = setting, \
+}
+
+static const struct snd_kcontrol_new ae9_voice_controls[] = {
+	AE9_VOICE_CTL("Enable InFX Capture Switch", AE9_VOICE_MASTER),
+	AE9_VOICE_CTL("FX: Noise Reduction Capture Switch", AE9_VOICE_NR),
+	AE9_VOICE_CTL("FX: Echo Cancellation Capture Switch", AE9_VOICE_AEC),
+	AE9_VOICE_CTL("FX: Mic SVM Capture Switch", AE9_VOICE_SVM),
+	AE9_VOICE_CTL("FX: Mic EQ Capture Enum", AE9_VOICE_MICEQ),
+	AE9_VOICE_CTL("VoiceFX Capture Switch", AE9_VOICE_VOICEFX),
+	/* Keep the inherited ABI, but never enable digital-mic Voice Focus. */
+	AE9_VOICE_CTL("FX: Voice Focus Capture Switch", AE9_VOICE_FOCUS),
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Voice Clarity Active Capture Switch",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ |
+			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = ae9_voice_info,
+		.get = ae9_voice_get,
+		.private_value = AE9_VOICE_ACTIVE,
+	},
+	{ }
+};
+
+#undef AE9_VOICE_CTL
+/* AE9_VOICE_END */
+
 static int ca0132_build_controls(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -8017,6 +9002,8 @@ static int ca0132_build_controls(struct hda_codec *codec)
 	 */
 	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT;
 	for (i = 0; i < num_fx; i++) {
+		if (ca0132_quirk(spec) == QUIRK_AE9 && i >= OUT_EFFECTS_COUNT)
+			continue;
 		/* Desktop cards break if Echo Cancellation is used. */
 		if (ca0132_use_pci_mmio(spec)) {
 			if (i == (ECHO_CANCELLATION - IN_EFFECT_START_NID +
@@ -8049,8 +9036,11 @@ static int ca0132_build_controls(struct hda_codec *codec)
 		if (err < 0)
 			return err;
 
-		err = add_fx_switch(codec, CRYSTAL_VOICE,
-					"Enable InFX", 1);
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			err = snd_hda_add_new_ctls(codec, ae9_voice_controls);
+		else
+			err = add_fx_switch(codec, CRYSTAL_VOICE,
+					    "Enable InFX", 1);
 		if (err < 0)
 			return err;
 
@@ -8080,9 +9070,11 @@ static int ca0132_build_controls(struct hda_codec *codec)
 		if (err < 0)
 			return err;
 	}
-	err = add_voicefx(codec);
-	if (err < 0)
-		return err;
+	if (ca0132_quirk(spec) != QUIRK_AE9) {
+		err = add_voicefx(codec);
+		if (err < 0)
+			return err;
+	}
 
 	/*
 	 * If the codec uses alt_functions, you need the enumerated controls
@@ -8227,6 +9219,20 @@ static const struct hda_pcm_stream ca0132_pcm_analog_capture = {
 	},
 };
 
+/* Only the main AE-9 analog ADC uses the voice-processing constraints. */
+static const struct hda_pcm_stream ae9_pcm_analog_capture = {
+	.substreams = 1,
+	.channels_min = 2,
+	.channels_max = 2,
+	.ops = {
+		.open = ae9_voice_capture_open,
+		.close = ae9_voice_capture_close,
+		.prepare = ae9_voice_capture_prepare,
+		.cleanup = ae9_voice_capture_cleanup,
+		.get_delay = ca0132_capture_pcm_delay,
+	},
+};
+
 static const struct hda_pcm_stream ca0132_pcm_digital_playback = {
 	.substreams = 1,
 	.channels_min = 2,
@@ -8280,6 +9286,8 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 		goto digital;
 	}
 	info->stream[SNDRV_PCM_STREAM_CAPTURE] = ca0132_pcm_analog_capture;
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		info->stream[SNDRV_PCM_STREAM_CAPTURE] = ae9_pcm_analog_capture;
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].substreams = 1;
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->adcs[0];
 
@@ -12068,19 +13076,33 @@ static void ca0132_download_dsp(struct hda_codec *codec)
 		ca0132_set_dsp_msr(codec, true);
 }
 
-static void ca0132_process_dsp_response(struct hda_codec *codec,
-					struct hda_jack_callback *callback)
+static void ca0132_process_dsp_response_locked(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	codec_dbg(codec, "ca0132_process_dsp_response\n");
-	CLASS(snd_hda_power_pm, pm)(codec);
 	if (spec->wait_scp) {
 		if (dspio_get_response_data(codec) >= 0)
 			spec->wait_scp = 0;
 	}
 
 	dspio_clear_response_queue(codec);
+}
+
+static void ca0132_process_dsp_response(struct hda_codec *codec,
+					struct hda_jack_callback *callback)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	codec_dbg(codec, "%s\n", __func__);
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		if (pm.err < 0)
+			return;
+		guard(mutex)(&spec->ae9_scp_mutex);
+		ca0132_process_dsp_response_locked(codec);
+		return;
+	}
+	ca0132_process_dsp_response_locked(codec);
 }
 
 static void hp_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
@@ -12101,6 +13123,22 @@ static void amic_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		struct ae9_voice_state *voice = &spec->ae9_voice;
+		int err;
+
+		CLASS(snd_hda_power_pm, pm)(codec);
+		if (pm.err < 0)
+			return;
+		guard(mutex)(&voice->mutex);
+		if (voice->prepared || voice->suspended)
+			return;
+		err = ca0132_alt_select_in(codec);
+		voice->applied_valid = false;
+		if (err < 0)
+			voice->source_dirty = true;
+		return;
+	}
 	if (ca0132_use_alt_functions(spec))
 		ca0132_alt_select_in(codec);
 	else
@@ -12458,6 +13496,11 @@ static void ae9_exit_chip(struct hda_codec *codec)
 	if (ca0132_quirk(spec) != QUIRK_AE9 || !spec->mem_base ||
 	    spec->dsp_state != DSP_DOWNLOADED)
 		return;
+
+	/* Withdraw Voice Clarity while the DSP still accepts its messages. */
+	err = ae9_voice_quiesce(codec);
+	if (err < 0)
+		codec_warn(codec, "AE-9: voice power-down failed: %d\n", err);
 
 	/* The shared mic setup also starts streams 3/4 on the AE-9. */
 	chipio_set_stream_control(codec, 0x03, 0);
@@ -13251,6 +14294,11 @@ static int ca0132_init(struct hda_codec *codec)
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return ae9_dsp_init_failed(codec, err);
 		ca0132_alt_select_in(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			err = ae9_voice_restore(codec);
+			if (err < 0)
+				return ae9_dsp_init_failed(codec, err);
+		}
 	} else {
 		ca0132_select_out(codec);
 		ca0132_select_mic(codec);
@@ -13687,6 +14735,8 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	codec->spec = spec;
 	spec->codec = codec;
 	mutex_init(&spec->ae9_output_mutex);
+	mutex_init(&spec->ae9_voice.mutex);
+	mutex_init(&spec->ae9_scp_mutex);
 	spin_lock_init(&spec->ae9_acm_work_lock);
 
 	/* Detect codec quirk */
@@ -13864,8 +14914,10 @@ static int ca0132_codec_suspend(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	ae9_acm_stop(spec, false);
-	if (ca0132_quirk(spec) == QUIRK_AE9)
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		ae9_exit_chip(codec);
+		ae9_voice_suspend(codec);
+	}
 	spec->ae9_acm_present = false;	/* re-probe the ACM after resume */
 	return 0;
 }
