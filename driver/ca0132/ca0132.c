@@ -5949,18 +5949,6 @@ static int ae9_control_param(struct hda_codec *codec, unsigned int id,
 	return ae9_voice_param_locked(codec, id, value);
 }
 
-static int ae9_input_stream(struct hda_codec *codec, int streamid, int enable)
-{
-	struct ca0132_spec *spec = codec->spec;
-	int err;
-
-	guard(mutex)(&spec->chipio_mutex);
-	err = ae9_voice_param_locked(codec, CONTROL_PARAM_STREAM_ID, streamid);
-	if (err < 0)
-		return err;
-	return ae9_voice_param_locked(codec, CONTROL_PARAM_STREAM_CONTROL, enable);
-}
-
 static int ae9_input_vipsource(struct hda_codec *codec, int val)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -5971,12 +5959,6 @@ static int ae9_input_vipsource(struct hda_codec *codec, int val)
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return -EIO;
-	err = ae9_input_stream(codec, 0x03, 0);
-	if (err < 0)
-		return err;
-	err = ae9_input_stream(codec, 0x04, 0);
-	if (err < 0)
-		return err;
 	if (!on) {
 		err = ae9_control_param(codec, CONTROL_PARAM_VIP_SOURCE, 0);
 		if (err < 0)
@@ -6005,11 +5987,7 @@ static int ae9_input_vipsource(struct hda_codec *codec, int val)
 		if (err < 0)
 			return err;
 	}
-	err = ae9_input_stream(codec, 0x03, 1);
-	if (err < 0)
-		return err;
-	err = ae9_input_stream(codec, 0x04, 1);
-	return err < 0 ? err : 1;
+	return 1;
 }
 
 /* The caller owns a power reference and the voice mutex; the ADC is idle. */
@@ -6034,12 +6012,6 @@ static int ae9_select_input(struct hda_codec *codec)
 	/* A failed PM cleanup may have cleared prepared without detaching. */
 	if (!voice->prepared)
 		__snd_hda_codec_cleanup_stream(codec, spec->adcs[0], 1);
-	err = ae9_input_stream(codec, 0x03, 0);
-	if (err < 0)
-		goto fail;
-	err = ae9_input_stream(codec, 0x04, 0);
-	if (err < 0)
-		goto fail;
 	spec->cur_mic_type = spec->in_enum_val;
 	if (line) {
 		err = ca0132_mic_boost_set(codec, 0);
@@ -6056,30 +6028,17 @@ static int ae9_select_input(struct hda_codec *codec)
 				   line ? FLOAT_ZERO : FLOAT_THREE);
 	if (err < 0)
 		goto fail;
-	if (!line) {
-		err = ae9_input_stream(codec, 0x03, 1);
-		if (err < 0)
-			goto fail;
-		err = ae9_input_stream(codec, 0x04, 1);
-		if (err < 0)
-			goto fail;
-	}
 	err = chipio_write(codec, 0x18B098, line ? 0 : 0x0c);
 	if (err < 0)
 		goto fail;
 	err = chipio_write(codec, 0x18B09C, line ? 0 : 0x4c);
 	if (err < 0)
 		goto fail;
-	if (line) {
-		err = ae9_input_stream(codec, 0x03, 1);
+	if (!line) {
+		err = ca0132_alt_mic_boost_set(codec, spec->mic_boost_enum_val);
 		if (err < 0)
 			goto fail;
-		err = ae9_input_stream(codec, 0x04, 1);
-	} else {
-		err = ca0132_alt_mic_boost_set(codec, spec->mic_boost_enum_val);
 	}
-	if (err < 0)
-		goto fail;
 	err = ca0132_cvoice_switch_set(codec);
 	if (err < 0)
 		goto fail;
@@ -8768,6 +8727,8 @@ static int ae9_voice_status(struct hda_codec *codec)
 			&status, &size);
 	if (err < 0)
 		return err;
+	if (size == sizeof(status))
+		codec_info(codec, "AE-9 voice: status=0x%08x bytes=%u\n", status, size);
 	return size == sizeof(status) ? 0 : -EIO;
 }
 
@@ -8802,7 +8763,8 @@ static int ae9_voice_apply_locked(struct hda_codec *codec,
 	preset = effective.value[AE9_VOICE_VOICEFX];
 	if (!valid || preset != voice->applied.value[AE9_VOICE_VOICEFX]) {
 		for (i = 0; i < (preset ? VOICEFX_MAX_PARAM_COUNT : 1); i++) {
-			err = ae9_voice_set(codec, 0x95, 0x0a + i,
+			err = ae9_voice_set(codec, ca0132_voicefx.mid,
+					    ca0132_voicefx.reqs[i],
 					    ca0132_voicefx_presets[preset].vals[i]);
 			if (err < 0)
 				goto fail;
@@ -9072,6 +9034,10 @@ static int ae9_voice_capture_prepare(struct hda_pcm_stream *hinfo,
 	err = ae9_mic_gain_restore(codec);
 	if (err < 0)
 		goto fail;
+	codec_info(codec,
+		   "AE-9 voice: prepare rate=%u format=0x%04x tag=%u source=%u processed=%u\n",
+		   substream->runtime->rate, format, stream_tag,
+		   spec->in_enum_val, want);
 	if (want) {
 		err = ae9_voice_apply_locked(codec, &voice->desired);
 		if (err < 0)
@@ -10374,8 +10340,11 @@ static void ca0132_alt_dsp_initial_mic_setup(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
 
-	chipio_set_stream_control(codec, 0x03, 0);
-	chipio_set_stream_control(codec, 0x04, 0);
+	/* AE-9 voice routing must leave the internal DSP streams 3/4 alone. */
+	if (ca0132_quirk(spec) != QUIRK_AE9) {
+		chipio_set_stream_control(codec, 0x03, 0);
+		chipio_set_stream_control(codec, 0x04, 0);
+	}
 
 	chipio_set_conn_rate(codec, MEM_CONNID_MICIN1, SR_96_000);
 	chipio_set_conn_rate(codec, MEM_CONNID_MICOUT1, SR_96_000);
@@ -10383,8 +10352,10 @@ static void ca0132_alt_dsp_initial_mic_setup(struct hda_codec *codec)
 	tmp = FLOAT_THREE;
 	dspio_set_uint_param(codec, 0x80, 0x00, tmp);
 
-	chipio_set_stream_control(codec, 0x03, 1);
-	chipio_set_stream_control(codec, 0x04, 1);
+	if (ca0132_quirk(spec) != QUIRK_AE9) {
+		chipio_set_stream_control(codec, 0x03, 1);
+		chipio_set_stream_control(codec, 0x04, 1);
+	}
 
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -13265,8 +13236,10 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 		goto fail;
 	ae9_post_dsp_dac_init(codec);		/* W5: ES9038 + SABRE registers */
 	ae9_post_dsp_finish(codec);		/* W6: GPIO4, DAC unmute */
-	if (ae9_mic)
+	if (ae9_mic) {
 		ca0132_alt_dsp_initial_mic_setup(codec);
+		codec_info(codec, "AE-9: legacy mic DSP stream 3/4 commands disabled\n");
+	}
 
 	/* W10: effects + speaker-tuning defaults, as Windows does after unmute */
 	stage = "effect defaults";
@@ -13981,9 +13954,6 @@ static void ae9_exit_chip(struct hda_codec *codec)
 	if (err < 0)
 		codec_warn(codec, "AE-9: voice power-down failed: %d\n", err);
 
-	/* The shared mic setup also starts streams 3/4 on the AE-9. */
-	chipio_set_stream_control(codec, 0x03, 0);
-	chipio_set_stream_control(codec, 0x04, 0);
 	/* Reverse the AE-9 playback stream startup. */
 	chipio_set_stream_control(codec, 0x18, 0);
 	msleep(50);
