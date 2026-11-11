@@ -15412,7 +15412,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1-knobpoll1-micjack1");
+MODULE_VERSION("0.2.0-preview11-voice2");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

@@ -1,8 +1,8 @@
 # Sound Blaster AE-9 — Linux DKMS driver
 
 An ALSA driver for the **Creative Sound Blaster AE-9 PCIe sound card** and
-its external **Audio Control Module (ACM)**. This branch packages the stable
-micjack1 driver as two DKMS modules: `snd-hda-core` and
+its external **Audio Control Module (ACM)**. This DKMS preview
+consolidates the AE-9 voice and stability improvements as two DKMS modules: `snd-hda-core` and
 `snd-hda-codec-ca0132`.
 
 ## Features
@@ -20,14 +20,45 @@ five-second intervals. XLR/TRS detection, surround/optical output and
 suspend/resume are not fully qualified. Direct mode and automatic native
 sample-rate switching are not included in this branch.
 
+The driver keeps the microphone handling and complete
+SCP-message serialization. On AE-9, SCP reads now preserve transport errors
+and reject unexpected vendor status values. FX level and crossover controls
+report errors, retain the previous cached value on failure, and return an ALSA
+change notification after success. Their transactions share the output mutex.
+The AE-9 bass-redirection crossover also uses the advertised 10–1000 Hz range
+and restores its own cached frequency. Extra `vc2-trace1` logging remains in
+the separate diagnostic version. Software checks alone do not establish hardware reliability.
+
+AE-9 input routing now checks each operation that can report an error. A
+failed selection remains invalid until a complete retry; capture preparation
+detaches the old ADC before rebuilding an uncertain route. Init/resume keeps
+the saved PCM configuration and restores a surviving ADC tag only after all
+source, gain and voice operations succeed.
+
+AE-9 microphone setup, source selection and teardown leave the internal DSP
+streams 3/4 untouched, matching the isolated `voice1` correction tested on the
+reference system. Brief user recordings reported clear NR, VoiceFX, Smart
+Volume and Mic EQ capture, with the played reference suppressed during the
+AEC comparison. This consolidated source adds shared VoiceFX identifiers;
+it has not itself been installed. Prolonged voice sessions and suspend/resume
+remain unqualified. Other CA0132 cards retain their stream 3/4 handling.
+
+Output routing now has a separate applied-state flag. Errors prevent new
+playback preparation and ACM output writes until a complete selection succeeds.
+The periodic jack poll does not retry a failed switch on an unchanged jack.
+An explicit selection or codec init can restore the route. Speaker configuration
+controls also report failures and retain their previous cached values. These
+changes are restricted to AE-9; successful software command sequences do not
+prove physical DAC state or audio quality.
+
 ## Compatibility
 
-This is a **DKMS preview**, version `0.2.0-preview2`, for **x86_64 Linux
+This is a **DKMS preview**, version `0.2.0-preview11-voice2`, for **x86_64 Linux
 7.0–7.3** with the expected stable HDA/ALSA APIs. The HDA core and CA0132
 codec must be configured as modules, not built into the kernel.
 
 Both modules have been compiled against Ubuntu `7.0.0-42-generic` and XanMod
-`7.2.14-x64v3-xanmod1`. Fedora, Arch and CachyOS kernels remain unqualified;
+`7.3.3-x64v3-xanmod1`. Fedora, Arch and CachyOS kernels remain unqualified;
 the allowed version range is not a guarantee for every distribution kernel.
 Linux 6.x and the development-kernel adaptations are outside this package.
 The latter are maintained separately on
@@ -182,8 +213,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -214,7 +245,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview2 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
