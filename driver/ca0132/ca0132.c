@@ -2419,9 +2419,50 @@ static int dspio_write_multiple(struct hda_codec *codec,
 	return status;
 }
 
+/* Keep HDA errors separate from vendor status and arbitrary SCP payload. */
+static int ae9_dspio_read_status(struct hda_codec *codec, unsigned int reg)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
+	unsigned int status;
+	int err;
+
+	do {
+		err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL, reg, 0,
+				    &status);
+		if (err < 0)
+			return err;
+		if (status == VENDOR_STATUS_DSPIO_OK)
+			return 0;
+		if (status != VENDOR_STATUS_DSPIO_BUSY)
+			return -EIO;
+		msleep(20);
+	} while (time_before(jiffies, timeout));
+
+	return -EIO;
+}
+
 static int dspio_read(struct hda_codec *codec, unsigned int *data)
 {
+	struct ca0132_spec *spec = codec->spec;
 	int status;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		unsigned int value;
+
+		status = ae9_dspio_read_status(codec,
+					       VENDOR_DSPIO_SCP_POST_READ_DATA);
+		if (status < 0)
+			return status;
+		status = ae9_dspio_read_status(codec, VENDOR_DSPIO_STATUS);
+		if (status < 0)
+			return status;
+		status = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL,
+				       VENDOR_DSPIO_SCP_READ_DATA, 0, &value);
+		if (status < 0)
+			return status;
+		*data = value;
+		return 0;
+	}
 
 	status = dspio_send(codec, VENDOR_DSPIO_SCP_POST_READ_DATA, 0);
 	if (status == -EIO)
