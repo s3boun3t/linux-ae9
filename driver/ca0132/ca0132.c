@@ -5341,7 +5341,16 @@ static int ca0132_alt_surround_set_bass_redirection(struct hda_codec *codec,
 
 	/* If it is enabled, make sure to set the crossover frequency. */
 	if (tmp) {
-		tmp = float_xbass_xover_lookup[spec->xbass_xover_freq];
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			long value = spec->bass_redirect_xover_freq;
+
+			if (value < 1 || value >
+			    ARRAY_SIZE(float_xbass_xover_lookup))
+				return -EINVAL;
+			tmp = float_xbass_xover_lookup[value - 1];
+		} else {
+			tmp = float_xbass_xover_lookup[spec->xbass_xover_freq];
+		}
 		err = dspio_set_uint_param(codec, 0x96,
 				SPEAKER_BASS_REDIRECT_XOVER_FREQ, tmp);
 		if (err < 0)
@@ -6414,13 +6423,20 @@ static int ca0132_vnode_switch_set(struct snd_kcontrol *kcontrol,
 }
 /* End of control change helpers. */
 
-static void ca0132_alt_bass_redirection_xover_set(struct hda_codec *codec,
-		long idx)
+static int ca0132_alt_bass_redirection_xover_set(struct hda_codec *codec,
+						 long idx)
 {
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
 	CLASS(snd_hda_power, pm)(codec);
 
-	dspio_set_param(codec, 0x96, 0x20, SPEAKER_BASS_REDIRECT_XOVER_FREQ,
-			&(float_xbass_xover_lookup[idx]), sizeof(unsigned int));
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		idx--;
+	err = dspio_set_param(codec, 0x96, 0x20,
+			      SPEAKER_BASS_REDIRECT_XOVER_FREQ,
+			      &float_xbass_xover_lookup[idx], sizeof(unsigned int));
+	return ca0132_quirk(spec) == QUIRK_AE9 ? err : 0;
 }
 
 /*
@@ -6435,7 +6451,8 @@ static void ca0132_alt_bass_redirection_xover_set(struct hda_codec *codec,
 static int ca0132_alt_slider_ctl_set(struct hda_codec *codec, hda_nid_t nid,
 			  const unsigned int *lookup, int idx)
 {
-	int i = 0;
+	struct ca0132_spec *spec = codec->spec;
+	int i = 0, err;
 	unsigned int y;
 	/*
 	 * For X_BASS, req 2 is actually crossover freq instead of
@@ -6452,21 +6469,65 @@ static int ca0132_alt_slider_ctl_set(struct hda_codec *codec, hda_nid_t nid,
 			if (ca0132_effects[i].nid == X_BASS)
 				break;
 
-		dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
-				ca0132_effects[i].reqs[1],
-				&(lookup[idx - 1]), sizeof(unsigned int));
+		err = dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
+				      ca0132_effects[i].reqs[1],
+				      &lookup[idx - 1], sizeof(unsigned int));
 	} else {
 		/* Find the actual effect structure */
 		for (i = 0; i < OUT_EFFECTS_COUNT; i++)
 			if (nid == ca0132_effects[i].nid)
 				break;
 
-		dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
-				ca0132_effects[i].reqs[y],
-				&(lookup[idx]), sizeof(unsigned int));
+		err = dspio_set_param(codec, ca0132_effects[i].mid, 0x20,
+				      ca0132_effects[i].reqs[y],
+				      &lookup[idx], sizeof(unsigned int));
 	}
 
-	return 0;
+	return ca0132_quirk(spec) == QUIRK_AE9 ? err : 0;
+}
+
+static int ae9_fx_slider_put(struct hda_codec *codec, hda_nid_t nid,
+			     long value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	long *cur_val;
+	int err;
+
+	if (nid == XBASS_XOVER || nid == BASS_REDIRECTION_XOVER) {
+		if (value < 1 || value > ARRAY_SIZE(float_xbass_xover_lookup))
+			return -EINVAL;
+		cur_val = nid == XBASS_XOVER ? &spec->xbass_xover_freq :
+			&spec->bass_redirect_xover_freq;
+	} else {
+		if (nid < OUT_EFFECT_START_NID ||
+		    nid >= OUT_EFFECT_START_NID + ARRAY_SIZE(spec->fx_ctl_val) ||
+		    value < 0 || value >= ARRAY_SIZE(float_zero_to_one_lookup))
+			return -EINVAL;
+		cur_val = &spec->fx_ctl_val[nid - OUT_EFFECT_START_NID];
+	}
+
+	/* Resume may restore output state: acquire power before its mutex. */
+	CLASS(snd_hda_power, pm)(codec);
+	if (pm.err < 0)
+		return pm.err;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (*cur_val == value)
+		return 0;
+
+	if (nid == BASS_REDIRECTION_XOVER)
+		err = ca0132_alt_bass_redirection_xover_set(codec, value);
+	else if (nid == XBASS_XOVER)
+		err = ca0132_alt_slider_ctl_set(codec, nid,
+						float_xbass_xover_lookup, value);
+	else
+		err = ca0132_alt_slider_ctl_set(codec, nid,
+						float_zero_to_one_lookup, value);
+	if (err < 0)
+		return err;
+
+	*cur_val = value;
+	return 1;
 }
 
 static int ca0132_alt_xbass_xover_slider_ctl_get(struct snd_kcontrol *kcontrol,
@@ -6476,6 +6537,13 @@ static int ca0132_alt_xbass_xover_slider_ctl_get(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	long *valp = ucontrol->value.integer.value;
 	hda_nid_t nid = get_amp_nid(kcontrol);
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		*valp = nid == BASS_REDIRECTION_XOVER ?
+			spec->bass_redirect_xover_freq : spec->xbass_xover_freq;
+		return 0;
+	}
 
 	if (nid == BASS_REDIRECTION_XOVER)
 		*valp = spec->bass_redirect_xover_freq;
@@ -6493,6 +6561,12 @@ static int ca0132_alt_slider_ctl_get(struct snd_kcontrol *kcontrol,
 	hda_nid_t nid = get_amp_nid(kcontrol);
 	long *valp = ucontrol->value.integer.value;
 	int idx = nid - OUT_EFFECT_START_NID;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		*valp = spec->fx_ctl_val[idx];
+		return 0;
+	}
 
 	*valp = spec->fx_ctl_val[idx];
 	return 0;
@@ -6538,6 +6612,9 @@ static int ca0132_alt_xbass_xover_slider_put(struct snd_kcontrol *kcontrol,
 	long *cur_val;
 	int idx;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return ae9_fx_slider_put(codec, nid, *valp);
+
 	if (nid == BASS_REDIRECTION_XOVER)
 		cur_val = &spec->bass_redirect_xover_freq;
 	else
@@ -6566,6 +6643,9 @@ static int ca0132_alt_effect_slider_put(struct snd_kcontrol *kcontrol,
 	hda_nid_t nid = get_amp_nid(kcontrol);
 	long *valp = ucontrol->value.integer.value;
 	int idx;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return ae9_fx_slider_put(codec, nid, *valp);
 
 	idx = nid - EFFECT_START_NID;
 	/* any change? */
