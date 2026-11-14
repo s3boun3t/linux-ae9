@@ -8686,27 +8686,38 @@ static int ae9_voice_set(struct hda_codec *codec, int mid, int req, u32 val)
 static int ae9_voice_param_locked(struct hda_codec *codec,
 				  unsigned int id, unsigned int value)
 {
+	const char *stage = "compact";
 	int err;
 
-	err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
-	if (err < 0)
-		return err;
+	/* Compact parameters are single verbs, without a ChipIO status query. */
 	if (id < 32 && value < 8) {
 		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 					  VENDOR_CHIPIO_PARAM_SET,
 					  (value << 5) | id);
 	} else {
+		/* Keep the extended selector/value pair under the caller's lock. */
+		stage = "extended-ready";
+		err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+		if (err < 0)
+			goto fail;
+		stage = "extended-id";
 		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 					  VENDOR_CHIPIO_PARAM_EX_ID_SET, id);
 		if (err < 0)
-			return err;
+			goto fail;
+		stage = "extended-value";
 		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 					  VENDOR_CHIPIO_PARAM_EX_VALUE_SET,
 					  value);
 	}
 	if (err < 0)
-		return err;
-	return chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+		goto fail;
+	return 0;
+fail:
+	codec_err(codec,
+		  "AE-9 parameter failed: stage=%s id=%u value=%u err=%d\n",
+		  stage, id, value, err);
+	return err;
 }
 
 static int ae9_voice_connections(struct hda_codec *codec, unsigned int rate)
