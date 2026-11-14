@@ -4415,17 +4415,15 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
  * wait; status 0x860/0x854/0x840; mode 3; read strobe 0x208 = 0xffff; wait;
  * status; VALUE = 0x208 (that access returned 0x80 = ES9038 reg 0x07's
  * power-on default); mode 2; relock. The .ops.txt decoder mislabels these
- * mode-3 accesses as writes of 0x00. Returns the register byte.
+ * mode-3 accesses as writes of 0x00. Returns the raw 32-bit result.
  */
-static unsigned int ca0113_mmio_command_get(struct hda_codec *codec,
+static unsigned int ca0113_mmio_read_locked(struct hda_codec *codec,
 					    unsigned int group, unsigned int reg)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int val;
 
-	if (!spec->mem_base)
-		return 0xffffffff;
-	guard(mutex)(&spec->mem_mutex);
+	lockdep_assert_held(&spec->mem_mutex);
 	ca0113_mmio_writel(spec, 0x210, 0x0000007e);
 	readl(spec->mem_base + 0x210);
 	ca0113_mmio_writel(spec, 0x210, 0x0000005a);
@@ -4457,7 +4455,89 @@ static unsigned int ca0113_mmio_command_get(struct hda_codec *codec,
 	ca0113_mmio_writel(spec, 0x210, 0x00000000);
 	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
-	return val & 0xff;
+	return val;
+}
+
+static unsigned int ca0113_mmio_command_get(struct hda_codec *codec,
+					    unsigned int group, unsigned int reg)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (!spec->mem_base)
+		return 0xffffffff;
+	guard(mutex)(&spec->mem_mutex);
+	return ca0113_mmio_read_locked(codec, group, reg) & 0xff;
+}
+
+/* Opt-in only: retain the existing bring-up transactions by default. */
+static bool ae9_dac_diag;
+module_param(ae9_dac_diag, bool, 0444);
+MODULE_PARM_DESC(ae9_dac_diag,
+		 "AE-9 repeated configuration-register diagnostic at bring-up (default off)");
+
+struct ae9_dac_readback {
+	unsigned int raw[3];
+	unsigned int value;
+};
+
+/* Status reads may acknowledge an IRQ or latch a DPLL snapshot. */
+static bool ae9_dac_diag_reg_allowed(unsigned int group, unsigned int reg)
+{
+	if (group == 0x48) {
+		switch (reg) {
+		case 0x01:
+		case 0x07:
+		case 0x0a:
+		case 0x0b:
+		case 0x0c:
+		case 0x0e:
+		case 0x0f:
+		case 0x10:
+			return true;
+		}
+	} else if (group == 0x49) {
+		switch (reg) {
+		case 0x02:
+		case 0x04:
+		case 0x0a:
+		case 0x18:
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Matching bytes are not proof of freshness, device ACK or hardware state. */
+static int ae9_dac_read_diag(struct hda_codec *codec, unsigned int group,
+			     unsigned int reg, struct ae9_dac_readback *result)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int i;
+
+	if (!result)
+		return -EINVAL;
+	memset(result, 0xff, sizeof(*result));
+	if (ca0132_quirk(spec) != QUIRK_AE9 ||
+	    !ae9_dac_diag_reg_allowed(group, reg))
+		return -EINVAL;
+	if (!spec->mem_base)
+		return -ENODEV;
+
+	guard(mutex)(&spec->mem_mutex);
+	/* Helix 0.12.7 discards one cycle, retaining the next two. Keep our
+	 * captured mode-1 selection, readbacks and 20-ms waits unchanged.
+	 */
+	for (i = 0; i < ARRAY_SIZE(result->raw); i++)
+		result->raw[i] = ca0113_mmio_read_locked(codec, group, reg);
+	/* The first sample can be junk. Reject suspect retained samples,
+	 * while allowing an actual register byte of 0xff.
+	 */
+	if (result->raw[1] == ~0U || result->raw[2] == ~0U)
+		return -EIO;
+	if ((result->raw[1] & 0xff) != (result->raw[2] & 0xff))
+		return -EAGAIN;
+	result->value = result->raw[2] & 0xff;
+	return 0;
 }
 
 /* Command variant used by the AE-5/AE-7 sound-filter controls. */
@@ -11512,9 +11592,37 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 			{ "SABRE  0x04 vol (want 15)",    0x49, 0x04 },
 			{ "SABRE  0x18 (want ff)",        0x49, 0x18 },
 		};
-		for (i = 0; i < ARRAY_SIZE(dr); i++)
-			codec_info(codec, "AE-9 DSP-STATE   %-34s = %08x\n", dr[i].name,
-				   ca0113_mmio_command_get(codec, dr[i].grp, dr[i].reg));
+		for (i = 0; i < ARRAY_SIZE(dr); i++) {
+			struct ae9_dac_readback result;
+			int err;
+
+			if (!ae9_dac_diag) {
+				unsigned int value;
+
+				value = ca0113_mmio_command_get(codec,
+								dr[i].grp, dr[i].reg);
+				codec_info(codec,
+					   "AE-9 DSP-STATE   %-34s = %08x\n",
+					   dr[i].name, value);
+				continue;
+			}
+			if (!ae9_dac_diag_reg_allowed(dr[i].grp, dr[i].reg)) {
+				codec_info(codec,
+					   "AE-9 DAC-DIAG %02x/%02x skipped: status read side effects\n",
+					   dr[i].grp, dr[i].reg);
+				continue;
+			}
+			err = ae9_dac_read_diag(codec, dr[i].grp, dr[i].reg,
+						&result);
+			codec_info(codec,
+				   "AE-9 DAC-DIAG %02x/%02x raw=%08x,%08x,%08x err=%d freshness=unverified\n",
+				   dr[i].grp, dr[i].reg, result.raw[0],
+				   result.raw[1], result.raw[2], err);
+			if (!err)
+				codec_info(codec,
+					   "AE-9 DAC-DIAG %-34s byte=%02x (last two bytes match)\n",
+					   dr[i].name, result.value);
+		}
 	}
 }
 
