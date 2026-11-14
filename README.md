@@ -51,9 +51,40 @@ controls also report failures and retain their previous cached values. These
 changes are restricted to AE-9; successful software command sequences do not
 prove physical DAC state or audio quality.
 
+## Additional codec changes in this preview
+
+The optional clock snapshot collector and `ae9_clock_diag` parameter are
+removed. Remove obsolete `ae9_clock_diag=...` options from custom module
+configuration before installing this version. PLL/I2S setup is retained.
+
+AE-9 microphone boost writes both amp channels and forces a retry after a
+failed write. Levels remain 0/+10/+20/+30 dB, with 0 dB as the default.
+Firmware FLS segment bounds and the terminator are checked before transfer;
+these structural checks do not establish cryptographic identity.
+
+The primary AE-9 digital PCM is hidden while the secondary optical PCM is
+retained. Saved ALSA PCM/control indices may change. The previous primary
+widget initialization is retained, and the ACM headphone route uses physical
+pin 0x10. RCA and optical operation remain unqualified.
+
+AE-9 parameter exchanges retain transport errors. DSP LOW/HIGH writes stop
+on HDA errors without replaying an ambiguously accepted half-word. SBX on an
+already configured headphone route avoids a full output reroute. Failed SBX
+transactions do not publish their desired cache/LED state, and an interrupted
+SCP message blocks further writes until a confirmed DSP reset.
+
+`ae9_dac_diag` is an optional read-only module parameter, disabled by default.
+It repeats selected configuration-register reads and reports disagreement;
+matching values do not prove freshness or physical DAC state. It is separate
+from the removed clock collector and is not an audio-quality test.
+
+The timeout at boot is not declared resolved. Favorable user reports concern
+specific isolated candidates, including the three-module rirbread1 package.
+This combined two-module codec series has not been qualified on hardware.
+
 ## Compatibility
 
-This is a **DKMS preview**, version `0.2.0-preview11-voice2`, for **x86_64 Linux
+This is a **DKMS preview**, version `0.2.0-preview19-codec1`, for **x86_64 Linux
 7.0–7.3** with the expected stable HDA/ALSA APIs. The HDA core and CA0132
 codec must be configured as modules, not built into the kernel.
 
@@ -213,8 +244,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -245,7 +276,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview11-voice2 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation

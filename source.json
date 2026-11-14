@@ -1,15 +1,15 @@
 {
-  "driver_reference": "AE-9 voice2 consolidation, stability fixes and control/PCM simplifications",
-  "reference_commit": "65b65777e4eef9be59f490be118262c9c2b1e62a",
-  "codec_sha256": "1f9e8778ca769e143a590ff5cd247af9bb03c32faf5e301cdf537653f80ec463",
+  "driver_reference": "AE-9 codec-only corrections, safe reuse, firmware validation and SBX error containment",
+  "reference_commit": "684ea5f46c3d5e92837336f3c1458b2e6c963857",
+  "codec_sha256": "07fd3fb5bd166135fd998df35beb7c9409d0fe4daa70e5e61963882b071f874e",
   "hda_core_reference": "ae9_build 7.0-based core, unchanged .c/.h files",
   "development_kernel_adaptations": false,
-  "status": "DKMS preview; software validation and limited voice1 user observations, voice2 hardware qualification pending",
-  "reference_commit_scope": "Published parent of the twelve-commit series; codec_sha256 identifies the exact final source",
+  "status": "Local prepared codec series; software validation is distinct from hardware qualification",
+  "reference_commit_scope": "Published parent of the eighteen codec commits; codec_sha256 identifies this exact combined source",
   "consolidated_vc2_codec_sha256": "52519d3fdd5d0da45628888bd5ce7f283e9dc2b5340d550d7cec9a3da52f4270",
   "stability1_codec_sha256": "6f79fb26ae55d1d97dd9b87f762e9aa7a20aaa45be7c5186a552d19cbc2e5efe",
   "stability2_tested_codec_sha256": "8d7ed379b00c0baad27597cb255dda291250195f89b28b29408cc723c1279fac",
-  "packaging_revision": "preview11: unique package version ordered after the preserved preview10 voice2 candidate",
-  "package_version": "0.2.0-preview11-voice2",
-  "source_scope": "Excludes the separate THD-reset and DSP-state helper simplifications from the development worktree"
+  "packaging_revision": "preview19 codec-only, two modules; no new common HDA code",
+  "package_version": "0.2.0-preview19-codec1",
+  "source_scope": "Contains requested codec cleanup and functional fixes; excludes ICW/core/RIRB changes and earlyquirk1"
 }
