@@ -1402,6 +1402,7 @@ static int ae9_control_param(struct hda_codec *codec, unsigned int id,
 			     unsigned int value);
 static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source);
 static int ae9_voice_boost_put(struct hda_codec *codec, unsigned int boost);
+static void ae9_voice_invalidate_input_locked(struct ae9_voice_state *voice);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -5957,10 +5958,7 @@ static int ae9_select_input(struct hda_codec *codec)
 	int err;
 
 	lockdep_assert_held(&voice->mutex);
-	voice->source_dirty = true;
-	voice->applied_valid = false;
-	voice->route = false;
-	voice->gain_valid = false;
+	ae9_voice_invalidate_input_locked(voice);
 	if (spec->in_enum_val > FRONT_MIC)
 		return -EINVAL;
 	if (spec->dsp_state != DSP_DOWNLOADED)
@@ -8577,6 +8575,15 @@ static const struct ae9_miceq_preset {
 	  { 0, 8, 0, 12, 12, 4, 8, 10 } },
 };
 
+/* Caller holds voice->mutex; retain the logical PCM setup. */
+static void ae9_voice_invalidate_input_locked(struct ae9_voice_state *voice)
+{
+	voice->source_dirty = true;
+	voice->applied_valid = false;
+	voice->gain_valid = false;
+	voice->route = false;
+}
+
 static bool ae9_voice_wanted(const struct ae9_voice_config *cfg,
 			     unsigned int source)
 {
@@ -8953,10 +8960,7 @@ static int ae9_voice_capture_prepare(struct hda_pcm_stream *hinfo,
 	CLASS(snd_hda_power_pm, pm)(codec);
 	if (pm.err < 0) {
 		guard(mutex)(&voice->mutex);
-		voice->gain_valid = false;
-		voice->source_dirty = true;
-		voice->applied_valid = false;
-		voice->route = false;
+		ae9_voice_invalidate_input_locked(voice);
 		return pm.err;
 	}
 	guard(mutex)(&voice->mutex);
@@ -9039,20 +9043,10 @@ static int ae9_voice_capture_cleanup(struct hda_pcm_stream *hinfo,
 		voice->prepared = false;
 		voice->rate = 0;
 		voice->format = 0;
-		voice->applied_valid = false;
-		voice->gain_valid = false;
-		voice->source_dirty = true;
-		voice->route = false;
+		ae9_voice_invalidate_input_locked(voice);
 		return pm.err;
 	}
 	return ae9_voice_cleanup_locked(hinfo, codec);
-}
-
-static int ae9_voice_capture_close(struct hda_pcm_stream *hinfo,
-				   struct hda_codec *codec,
-				   struct snd_pcm_substream *substream)
-{
-	return ae9_voice_capture_cleanup(hinfo, codec, substream);
 }
 
 static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source)
@@ -9067,10 +9061,7 @@ static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source)
 	CLASS(snd_hda_power_pm, pm)(codec);
 	if (pm.err < 0) {
 		guard(mutex)(&voice->mutex);
-		voice->source_dirty = true;
-		voice->applied_valid = false;
-		voice->gain_valid = false;
-		voice->route = false;
+		ae9_voice_invalidate_input_locked(voice);
 		return pm.err;
 	}
 	guard(mutex)(&voice->mutex);
@@ -9190,10 +9181,7 @@ static int ae9_voice_restore(struct hda_codec *codec)
 	}
 	return 0;
 fail:
-	voice->source_dirty = true;
-	voice->applied_valid = false;
-	voice->gain_valid = false;
-	voice->route = false;
+	ae9_voice_invalidate_input_locked(voice);
 	return err;
 }
 
@@ -9232,10 +9220,7 @@ static void ae9_voice_suspend(struct hda_codec *codec)
 	guard(mutex)(&voice->mutex);
 	/* ALSA may retain a prepared PCM across suspend; keep its rate. */
 	voice->suspended = true;
-	voice->applied_valid = false;
-	voice->route = false;
-	voice->gain_valid = false;
-	voice->source_dirty = true;
+	ae9_voice_invalidate_input_locked(voice);
 }
 
 /* Init may retain the DSP image; restore invalid routes once, never in polling. */
@@ -9626,7 +9611,7 @@ static const struct hda_pcm_stream ae9_pcm_analog_capture = {
 	.channels_max = 2,
 	.ops = {
 		.open = ae9_voice_capture_open,
-		.close = ae9_voice_capture_close,
+		.close = ae9_voice_capture_cleanup,
 		.prepare = ae9_voice_capture_prepare,
 		.cleanup = ae9_voice_capture_cleanup,
 		.get_delay = ca0132_capture_pcm_delay,
