@@ -3597,6 +3597,28 @@ static const struct dsp_image_seg *get_next_seg_ptr(
 	return (struct dsp_image_seg *)((unsigned char *)(p) + dsp_sizeof(p));
 }
 
+/* Bound every FLS segment before the transfer code follows its count. */
+static int ca0132_validate_firmware(const struct firmware *fw)
+{
+	size_t offset = 0;
+
+	while (fw->size - offset >= sizeof(struct dsp_image_seg)) {
+		const u8 *p = fw->data + offset;
+		u32 count;
+
+		if (get_unaligned_le32(p) != g_magic_value)
+			return -EINVAL;
+		count = get_unaligned_le32(p + 2 * sizeof(u32));
+		if (!count)
+			return 0;
+		if (count > (fw->size - offset - sizeof(struct dsp_image_seg)) /
+			    sizeof(u32))
+			return -EINVAL;
+		offset += sizeof(struct dsp_image_seg) + (size_t)count * sizeof(u32);
+	}
+	return -EINVAL;
+}
+
 /*
  * CA0132 chip DSP transfer stuffs.  For DSP download.
  */
@@ -11081,7 +11103,8 @@ static int ae9_validate_overlay(const struct firmware *fw)
 	const u8 *p;
 	unsigned int i;
 
-	if (fw->size != AE9_OVERLAY_WORDS * sizeof(u32))
+	if (fw->size != AE9_OVERLAY_WORDS * sizeof(u32) ||
+	    ca0132_validate_firmware(fw))
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(headers); i++) {
 		p = fw->data + headers[i].word * sizeof(u32);
@@ -11123,7 +11146,7 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	static const unsigned int seq[] = { 4, 5, 0 };
-	const struct firmware *ovl_fw = NULL;
+	const struct firmware *ovl_fw __free(firmware) = NULL;
 	const u32 *overlay;
 	unsigned int val, rb = 0;
 	u32 *ld = NULL;
@@ -11238,7 +11261,6 @@ out:
 	if (err < 0 && overlay_started)
 		dsp_dma_stop(codec, 0, true);
 	kfree(ld);
-	release_firmware(ovl_fw);
 	return err;
 }
 
@@ -12908,11 +12930,10 @@ static void ca0132_set_dsp_msr(struct hda_codec *codec, bool is96k)
 
 static bool ca0132_download_dsp_images(struct hda_codec *codec)
 {
-	bool dsp_loaded = false;
 	int err;
 	struct ca0132_spec *spec = codec->spec;
 	const struct dsp_image_seg *dsp_os_image;
-	const struct firmware *fw_entry = NULL;
+	const struct firmware *fw_entry __free(firmware) = NULL;
 	/*
 	 * Alternate firmwares for different variants. The Recon3Di apparently
 	 * can use the default firmware, but I'll leave the option in case
@@ -12955,18 +12976,18 @@ static bool ca0132_download_dsp_images(struct hda_codec *codec)
 			return false;
 	}
 
+	if (ca0132_validate_firmware(fw_entry)) {
+		codec_err(codec, "ca0132 invalid DSP firmware image\n");
+		return false;
+	}
+
 	dsp_os_image = (struct dsp_image_seg *)(fw_entry->data);
 	if (dspload_image(codec, dsp_os_image, 0, 0, true, 0)) {
 		codec_err(codec, "ca0132 DSP load image failed\n");
-		goto exit_download;
+		return false;
 	}
 
-	dsp_loaded = dspload_wait_loaded(codec);
-
-exit_download:
-	release_firmware(fw_entry);
-
-	return dsp_loaded;
+	return dspload_wait_loaded(codec);
 }
 
 static void ca0132_download_dsp(struct hda_codec *codec)
