@@ -101,19 +101,6 @@ MODULE_FIRMWARE(AE9_DESKTOP_FW);
 MODULE_FIRMWARE(AE9_OVERLAY_FW);
 MODULE_FIRMWARE(AE9_OVERLAY_FW_PATH);
 
-/* AE-9 clock diagnostic limits and snapshot layout. */
-#define AE9_CLOCK_READ_MS	100
-#define AE9_CLOCK_GAP_MS	100
-#define AE9_CLOCK_DELAY_MS	1000
-#define AE9_CLOCK_TIMEOUT_MS	15000
-#define AE9_CLOCK_REG_COUNT	9
-#define AE9_CLOCK_PMU_COUNT	7
-#define AE9_CLOCK_SYS_BEFORE	8
-#define AE9_CLOCK_DAC_FIRST	9
-#define AE9_CLOCK_SYS_AFTER	18
-#define AE9_CLOCK_STEP_COUNT	20
-#define AE9_CLOCK_FLAGS_ID	0x100
-
 /* Compatibility name for the unbound system workqueue used by AE-9. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 #define AE9_WQ system_dfl_wq
@@ -125,7 +112,7 @@ MODULE_FIRMWARE(AE9_OVERLAY_FW_PATH);
 /*
  * AE-9 ACM service mode. 1 (default) enables live knob, display, button
  * and keepalive service. 0 initialises the ACM once, then parks service.
- * The worker schedules service, display and optional clock diagnostics;
+ * The worker schedules service, idle knob polls and display refreshes;
  * this is not an unconditional 500 ms register-polling loop.
  */
 static int ae9_acm_poll = 1;
@@ -157,12 +144,6 @@ static bool ae9_mic = true;
 module_param(ae9_mic, bool, 0444);
 MODULE_PARM_DESC(ae9_mic,
 		 "AE-9: initialise the DSP microphone path (default 1)");
-
-/* Opt-in transport reads scheduled during ACM service idle slots. */
-static bool ae9_clock_diag;
-module_param(ae9_clock_diag, bool, 0444);
-MODULE_PARM_DESC(ae9_clock_diag,
-		 "AE-9: opt-in DAC clock snapshots in ACM idle slots (default 0)");
 
 static const char *const dirstr[2] = { "Playback", "Capture" };
 
@@ -1290,11 +1271,11 @@ struct ca0132_spec {
 	struct hda_codec *codec;
 	struct delayed_work unsol_hp_work;
 	/*
-	 * AE-9 scheduler: control callbacks, PCM diagnostics, PM and the
+	 * AE-9 scheduler: control callbacks, PM and the
 	 * worker use ae9_acm_work_lock for queue/lifecycle state and deadlines.
 	 * The lock is released before I/O or synchronous work cancellation.
 	 */
-	struct delayed_work ae9_acm_work; /* ACM service, knob, display and diagnostics */
+	struct delayed_work ae9_acm_work; /* ACM service, knob and display */
 	spinlock_t ae9_acm_work_lock;
 	bool ae9_acm_active;
 	bool ae9_acm_removing;
@@ -1306,25 +1287,6 @@ struct ca0132_spec {
 	unsigned long ae9_acm_ui_due;
 	unsigned long ae9_acm_quiet_until;
 	unsigned int ae9_acm_refresh_log_left;
-	/* Clock acquisition state/results: ae9_acm_work_lock, sequence checked. */
-	bool ae9_clock_pending;
-	bool ae9_clock_failed;
-	unsigned int ae9_clock_step;
-	unsigned int ae9_clock_format;
-	u32 ae9_clock_seq;
-	u8 ae9_clock_value[AE9_CLOCK_REG_COUNT];
-	u32 ae9_clock_raw[AE9_CLOCK_REG_COUNT];
-	u32 ae9_clock_pmu[AE9_CLOCK_PMU_COUNT];
-	u32 ae9_clock_sys_before;
-	u32 ae9_clock_sys_after;
-	u32 ae9_clock_iiscfg_before;
-	u32 ae9_clock_iiscfg_after;
-	u32 ae9_clock_flags_before;
-	u32 ae9_clock_flags_after;
-	unsigned long ae9_clock_due;
-	unsigned long ae9_clock_expires;
-	u64 ae9_clock_sample_begin;
-	u64 ae9_clock_sample_end;
 	/*
 	 * ACM session/transport: init and service worker own the session.
 	 * Suspend clears presence after draining work; TX failure is latched
@@ -4602,8 +4564,6 @@ static long ca0132_effect_switch_state(struct ca0132_spec *spec, hda_nid_t nid)
 }
 
 static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when);
-static void ae9_clock_diag_request(struct hda_codec *codec, unsigned int format);
-static void ae9_clock_diag_cancel(struct ca0132_spec *spec);
 
 static void ae9_output_invalidate(struct hda_codec *codec)
 {
@@ -4632,12 +4592,10 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			snd_hda_codec_setup_stream(codec, spec->dacs[0],
 						   stream_tag, 0, format);
 		}
-		ae9_clock_diag_request(codec, format);
 		return 0;
 	}
 
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
-	ae9_clock_diag_request(codec, format);
 
 	return 0;
 }
@@ -4653,7 +4611,6 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 
 	/*If Playback effects are on, allow stream some time to flush
 	 *effects tail*/
-	ae9_clock_diag_cancel(spec);
 	if (ca0132_effect_switch_state(spec, PLAY_ENHANCEMENT))
 		msleep(50);
 
@@ -11462,8 +11419,8 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 /*
  * AE-9 Audio Control Module (ACM): UART at BAR2+0xc00, 4-byte register
  * stride, 115200 8N1, frames F0 .. F7. Protocol derived from Windows driver
- * analysis. One delayed worker arbitrates maintenance, idle knob polls,
- * display refreshes and optional clock diagnostics. Maintenance is normally
+ * analysis. One delayed worker arbitrates maintenance, idle knob polls and
+ * display refreshes. Maintenance is normally
  * scheduled 500 ms after completion, or 50 ms during knob turbo activity;
  * the other jobs use separate deadlines and quiet intervals. Mixer callbacks
  * request display/mode updates; they may also apply DSP or output controls.
@@ -11476,7 +11433,6 @@ enum ae9_acm_job {
 	AE9_ACM_JOB_NONE,
 	AE9_ACM_JOB_DISPLAY,
 	AE9_ACM_JOB_SERVICE,
-	AE9_ACM_JOB_CLOCK,
 	AE9_ACM_JOB_KNOB,
 };
 
@@ -11508,7 +11464,7 @@ static const u8 ae9_acm_unlock3_frame[] = {
 };
 
 /* Caller holds work_lock. UI activity must never move service_due. */
-/* AE-9 ACM scheduling, lifecycle and clock-diagnostic arbitration. */
+/* AE-9 ACM scheduling and lifecycle. */
 static unsigned long ae9_acm_next_ui_work_locked(struct ca0132_spec *spec)
 {
 	unsigned long now = jiffies, due = spec->ae9_acm_service_due;
@@ -11527,60 +11483,6 @@ static unsigned long ae9_acm_next_ui_work_locked(struct ca0132_spec *spec)
 	if (time_before(ui + msecs_to_jiffies(AE9_ACM_QUIET_MS), due))
 		due = ui;
 	return due;
-}
-
-/* The deadline is a reservation, not a hard realtime guarantee. */
-static bool ae9_clock_diag_allowed_locked(struct ca0132_spec *spec,
-					  unsigned long now)
-{
-	return READ_ONCE(ae9_clock_diag) &&
-		ca0132_quirk(spec) == QUIRK_AE9 &&
-		spec->ae9_clock_pending && !spec->ae9_clock_failed &&
-		spec->ae9_acm_active && !spec->ae9_acm_removing &&
-		READ_ONCE(ae9_acm_poll) && spec->ae9_acm_present &&
-		!spec->ae9_acm_turbo && !spec->ae9_acm_dead_ticks &&
-		!spec->ae9_acm_ui_pending &&
-		!READ_ONCE(spec->ae9_acm_pending_mode) &&
-		!READ_ONCE(spec->ae9_acm_pending_fx) &&
-		!spec->ae9_acm_show_mode_ticks &&
-		!spec->ae9_acm_display_tx_failed &&
-		!spec->ae9_acm_knob_tx_failed &&
-		!spec->ae9_acm_button_tx_failed &&
-		!READ_ONCE(spec->ae9_acm_tx_failed) &&
-		time_before(now, spec->ae9_clock_expires);
-}
-
-static unsigned long ae9_clock_diag_slot_locked(struct ca0132_spec *spec,
-						unsigned long due)
-{
-	unsigned long now = jiffies, at;
-	unsigned long margin = msecs_to_jiffies(AE9_CLOCK_READ_MS +
-						 AE9_ACM_QUIET_MS);
-
-	if (!ae9_clock_diag_allowed_locked(spec, now))
-		return due;
-	at = spec->ae9_clock_due;
-	if (time_before(at, spec->ae9_acm_quiet_until))
-		at = spec->ae9_acm_quiet_until;
-	if (time_before(at, now))
-		at = now;
-	if (time_before(at + margin, spec->ae9_acm_service_due) &&
-	    time_before(at, due))
-		return at;
-	return due;
-}
-
-static bool ae9_clock_diag_ready_locked(struct ca0132_spec *spec, u32 seq)
-{
-	unsigned long now = jiffies;
-	unsigned long margin = msecs_to_jiffies(AE9_CLOCK_READ_MS +
-						 AE9_ACM_QUIET_MS);
-
-	return seq == spec->ae9_clock_seq &&
-		ae9_clock_diag_allowed_locked(spec, now) &&
-		!time_before(now, spec->ae9_clock_due) &&
-		!time_before(now, spec->ae9_acm_quiet_until) &&
-		time_before(now + margin, spec->ae9_acm_service_due);
 }
 
 /* Idle C2 queries share the worker and leave room for the next service. */
@@ -11612,7 +11514,7 @@ static unsigned long ae9_acm_next_work_locked(struct ca0132_spec *spec)
 
 	if (time_before(knob, due))
 		due = knob;
-	return ae9_clock_diag_slot_locked(spec, due);
+	return due;
 }
 
 static void ae9_acm_queue_locked(struct ca0132_spec *spec)
@@ -11625,77 +11527,6 @@ static void ae9_acm_queue_locked(struct ca0132_spec *spec)
 	now = jiffies;
 	mod_delayed_work(AE9_WQ, &spec->ae9_acm_work,
 			 time_after(due, now) ? due - now : 0);
-}
-
-static void ae9_clock_diag_cancel(struct ca0132_spec *spec)
-{
-	unsigned long flags;
-
-	if (!READ_ONCE(ae9_clock_diag) || ca0132_quirk(spec) != QUIRK_AE9)
-		return;
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	spec->ae9_clock_seq++;
-	spec->ae9_clock_pending = false;
-	spec->ae9_clock_step = 0;
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	/* Sleepable cleanup/stop only: drain an already-started transaction. */
-	mutex_lock(&spec->mem_mutex);
-	mutex_unlock(&spec->mem_mutex);
-	mutex_lock(&spec->chipio_mutex);
-	mutex_unlock(&spec->chipio_mutex);
-}
-
-static void ae9_clock_diag_request(struct hda_codec *codec, unsigned int format)
-{
-	struct ca0132_spec *spec = codec->spec;
-	unsigned long flags;
-	u32 seq = 0;
-
-	if (!READ_ONCE(ae9_clock_diag) || ca0132_quirk(spec) != QUIRK_AE9)
-		return;
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	if (spec->ae9_acm_active && !spec->ae9_acm_removing &&
-	    !spec->ae9_clock_failed && READ_ONCE(ae9_acm_poll)) {
-		seq = ++spec->ae9_clock_seq;
-		spec->ae9_clock_pending = true;
-		spec->ae9_clock_step = 0;
-		spec->ae9_clock_format = format;
-		spec->ae9_clock_due = jiffies +
-			msecs_to_jiffies(AE9_CLOCK_DELAY_MS);
-		spec->ae9_clock_expires = jiffies +
-			msecs_to_jiffies(AE9_CLOCK_TIMEOUT_MS);
-		spec->ae9_clock_sample_begin = 0;
-		spec->ae9_clock_sample_end = 0;
-		memset(spec->ae9_clock_value, 0, sizeof(spec->ae9_clock_value));
-		ae9_acm_queue_locked(spec);
-	}
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	if (seq)
-		codec_info(codec,
-			   "AE-9 CLOCK request seq=%u hda_format=%04x configured_audio_hz=96000\n",
-			   seq, format);
-}
-
-static void ae9_clock_diag_expire(struct ca0132_spec *spec)
-{
-	unsigned long flags;
-	bool expired = false;
-	u32 seq = 0;
-
-	if (!READ_ONCE(ae9_clock_diag) || ca0132_quirk(spec) != QUIRK_AE9)
-		return;
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	if (spec->ae9_clock_pending &&
-	    time_after_eq(jiffies, spec->ae9_clock_expires)) {
-		seq = spec->ae9_clock_seq;
-		spec->ae9_clock_pending = false;
-		spec->ae9_clock_failed = true;
-		expired = true;
-	}
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	if (expired)
-		codec_warn(spec->codec,
-			   "AE-9 CLOCK expired seq=%u; diagnostic stopped\n", seq);
 }
 
 static void ae9_acm_display_changed(struct ca0132_spec *spec)
@@ -11789,7 +11620,6 @@ static void ae9_acm_stop(struct ca0132_spec *spec, bool removing)
 		spec->ae9_acm_removing = true;
 	spec->ae9_acm_active = false;
 	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	ae9_clock_diag_cancel(spec);
 	cancel_delayed_work_sync(&spec->ae9_acm_work);
 }
 
@@ -11814,9 +11644,6 @@ static enum ae9_acm_job ae9_acm_begin_work(struct ca0132_spec *spec)
 	if (spec->ae9_acm_active) {
 		if (!time_before(now, spec->ae9_acm_service_due))
 			job = AE9_ACM_JOB_SERVICE;
-		else if (!time_before(now, ae9_clock_diag_slot_locked(spec,
-								      spec->ae9_acm_service_due)))
-			job = AE9_ACM_JOB_CLOCK;
 		else if (!time_before(now, ae9_acm_next_knob_work_locked(spec)))
 			job = AE9_ACM_JOB_KNOB;
 		else if (!time_before(now, ae9_acm_next_ui_work_locked(spec)))
@@ -11864,316 +11691,6 @@ static void ae9_acm_finish_knob(struct ca0132_spec *spec)
 		spec->ae9_acm_service_due = due;
 	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
 	ae9_acm_finish_work(spec, 0);
-}
-
-/* AE-9 clock-diagnostic transport. */
-/*
- * Only the clock worker calls this. Match the boot-tested read transport,
- * but retain the raw reply so a sentinel cannot become a plausible byte.
- * This writes transport selectors, never a DAC configuration register.
- */
-static int ae9_clock_diag_read(struct ca0132_spec *spec, unsigned int reg,
-			       u32 seq, u32 *raw)
-{
-	void __iomem *b2 = spec->mem_base;
-	unsigned long flags, deadline;
-	ktime_t start;
-	u32 status;
-	int ret = 0;
-
-	if (!b2 || ca0132_quirk(spec) != QUIRK_AE9)
-		return -ENODEV;
-	/* Match the output writers' lock order, without delaying them to start. */
-	if (!mutex_trylock(&spec->ae9_output_mutex))
-		return -EAGAIN;
-	if (!mutex_trylock(&spec->mem_mutex)) {
-		ret = -EAGAIN;
-		goto output_unlock;
-	}
-	status = readl(b2 + AE9_U_STS);
-	if (status == ~0U || readl(b2 + 0x210) == ~0U) {
-		ret = -ENODEV;
-		goto unlock;
-	}
-	/* The DWORD TX-ready test is validated; LSR THRE is not reliable. */
-	if (!(status & 0x02) || (readb(b2 + AE9_U_LSR) & 0x01)) {
-		ret = -EAGAIN;
-		goto unlock;
-	}
-	/* trylock and the status reads may have used the reserved idle slot. */
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	deadline = spec->ae9_acm_service_due;
-	if (!ae9_clock_diag_ready_locked(spec, seq))
-		ret = -EAGAIN;
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	if (ret)
-		goto unlock;
-	start = ktime_get();
-	ca0113_mmio_writel(spec, 0x210, 0x0000007e);
-	readl(b2 + 0x210);
-	ca0113_mmio_writel(spec, 0x210, 0x0000005a);
-	readl(b2 + 0x210);
-	readl(b2 + 0x210);
-	ca0113_mmio_writel(spec, 0x20c, 0x00800001);
-	readl(b2 + 0x20c);
-	ca0113_mmio_writel(spec, 0x804, 0x48);
-	readl(b2 + 0x804);
-	ca0113_mmio_writel(spec, 0x20c, 0x00800003);
-	readl(b2 + 0x20c);
-	ca0113_mmio_writel(spec, 0x204, reg);
-	readl(b2 + 0x204);
-	msleep(20);
-	readl(b2 + 0x860);
-	readl(b2 + 0x854);
-	readl(b2 + 0x840);
-	ca0113_mmio_writel(spec, 0x20c, 0x00800003);
-	readl(b2 + 0x20c);
-	ca0113_mmio_writel(spec, 0x208, 0x0000ffff);
-	readl(b2 + 0x208);
-	msleep(20);
-	readl(b2 + 0x860);
-	readl(b2 + 0x854);
-	readl(b2 + 0x840);
-	*raw = readl(b2 + 0x208);
-	/* Relock even when the reply or the observed duration is invalid. */
-	ca0113_mmio_writel(spec, 0x20c, 0x00800002);
-	readl(b2 + 0x20c);
-	ca0113_mmio_writel(spec, 0x210, 0x00000000);
-	readl(b2 + 0x210);
-	readl(b2 + 0x210);
-	if (ktime_us_delta(ktime_get(), start) > AE9_CLOCK_READ_MS * 1000 ||
-	    time_after_eq(jiffies + msecs_to_jiffies(AE9_ACM_QUIET_MS),
-			  deadline))
-		ret = -ETIMEDOUT;
-	/* Captured BAR2 replies use 000000xx or ffff00xx, not just a byte. */
-	else if ((*raw & 0x0000ff00U) ||
-		 ((*raw & 0xffff0000U) && (*raw & 0xffff0000U) != 0xffff0000U))
-		ret = -EIO;
-	status = readl(b2 + AE9_U_STS);
-	if (status == ~0U || !(status & 0x02) ||
-	    (readb(b2 + AE9_U_LSR) & 0x01))
-		ret = -EIO;
-unlock:
-	mutex_unlock(&spec->mem_mutex);
-output_unlock:
-	mutex_unlock(&spec->ae9_output_mutex);
-	return ret;
-}
-
-/*
- * Read known PMU slots or the firmware flags plus I2S control register.
- * Only 8051 address selectors are written; never PLL_PMU_WRITE or EXRAM data.
- * HDA requests share chipio_mutex with the driver, unlike a hwdep utility.
- */
-static int ae9_clock_diag_hda_read(struct ca0132_spec *spec, u32 seq,
-				   unsigned int reg, u32 *raw, u32 *iiscfg)
-{
-	void __iomem *b2 = spec->mem_base;
-	struct hda_codec *codec = spec->codec;
-	unsigned long flags, deadline;
-	ktime_t start;
-	u32 status;
-	int ret = 0;
-
-	if (reg != AE9_CLOCK_FLAGS_ID && reg != 0x51 &&
-	    (reg < 0x40 || reg > 0x45))
-		return -EINVAL;
-	if (!b2 || ca0132_quirk(spec) != QUIRK_AE9)
-		return -ENODEV;
-	if (!mutex_trylock(&spec->ae9_output_mutex))
-		return -EAGAIN;
-	if (!mutex_trylock(&spec->chipio_mutex)) {
-		ret = -EAGAIN;
-		goto output_unlock;
-	}
-	status = readl(b2 + AE9_U_STS);
-	if (status == ~0U) {
-		ret = -ENODEV;
-		goto unlock;
-	}
-	if (!(status & 0x02) || (readb(b2 + AE9_U_LSR) & 0x01)) {
-		ret = -EAGAIN;
-		goto unlock;
-	}
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	deadline = spec->ae9_acm_service_due;
-	if (!ae9_clock_diag_ready_locked(spec, seq))
-		ret = -EAGAIN;
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	if (ret)
-		goto unlock;
-	start = ktime_get();
-	if (reg == AE9_CLOCK_FLAGS_ID) {
-		*iiscfg = readl(b2 + 0x100);
-		if (*iiscfg == ~0U) {
-			ret = -ENODEV;
-			goto unlock;
-		}
-		*raw = snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
-					  VENDOR_CHIPIO_FLAGS_GET, 0);
-	} else {
-		ret = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
-					  VENDOR_CHIPIO_8051_ADDRESS_LOW, reg);
-		if (ret < 0)
-			goto unlock;
-		ret = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
-					  VENDOR_CHIPIO_8051_ADDRESS_HIGH, 0);
-		if (ret < 0)
-			goto unlock;
-		*raw = snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
-					  VENDOR_CHIPIO_PLL_PMU_READ, 0);
-	}
-	/* Keep full HDA replies: the PMU register width is not inferred here. */
-	if (*raw == ~0U)
-		ret = -EIO;
-	else if (ktime_us_delta(ktime_get(), start) > AE9_CLOCK_READ_MS * 1000 ||
-		 time_after_eq(jiffies + msecs_to_jiffies(AE9_ACM_QUIET_MS),
-			       deadline))
-		ret = -ETIMEDOUT;
-	status = readl(b2 + AE9_U_STS);
-	if (status == ~0U || !(status & 0x02) ||
-	    (readb(b2 + AE9_U_LSR) & 0x01))
-		ret = -EIO;
-unlock:
-	mutex_unlock(&spec->chipio_mutex);
-output_unlock:
-	mutex_unlock(&spec->ae9_output_mutex);
-	return ret;
-}
-
-static void ae9_clock_diag_step(struct ca0132_spec *spec)
-{
-	static const unsigned int regs[AE9_CLOCK_REG_COUNT] = {
-		0x01, 0x0a, 0x0c, 0x40, 0x42, 0x43, 0x44, 0x45, 0x40
-	};
-	static const unsigned int pmu_regs[AE9_CLOCK_PMU_COUNT] = {
-		0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x51
-	};
-	unsigned long flags;
-	unsigned int step, reg = 0xff, format = 0, dac_index = 0;
-	u32 seq, raw = ~0U, dpll, iiscfg = ~0U;
-	u32 sys_before = 0, sys_after = 0, iis_before = 0, iis_after = 0;
-	u32 flags_before = 0, flags_after = 0;
-	u64 begin, end, sample_begin = 0, sample_end = 0;
-	u8 value[AE9_CLOCK_REG_COUNT];
-	u32 raw_value[AE9_CLOCK_REG_COUNT];
-	u32 pmu[AE9_CLOCK_PMU_COUNT];
-	bool hda;
-	int ret;
-	bool complete = false;
-
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	if (!ae9_clock_diag_ready_locked(spec, spec->ae9_clock_seq)) {
-		spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-		return;
-	}
-	seq = spec->ae9_clock_seq;
-	step = spec->ae9_clock_step;
-	if (step >= AE9_CLOCK_STEP_COUNT) {
-		ret = -EINVAL;
-		goto failed;
-	}
-	hda = step < AE9_CLOCK_SYS_BEFORE || step == AE9_CLOCK_STEP_COUNT - 1;
-	if (!step || step == AE9_CLOCK_STEP_COUNT - 1) {
-		reg = AE9_CLOCK_FLAGS_ID;
-	} else if (step < AE9_CLOCK_SYS_BEFORE) {
-		reg = pmu_regs[step - 1];
-	} else if (step == AE9_CLOCK_SYS_BEFORE || step == AE9_CLOCK_SYS_AFTER) {
-		reg = 0x00;
-	} else {
-		dac_index = step - AE9_CLOCK_DAC_FIRST;
-		reg = regs[dac_index];
-	}
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	begin = ktime_get_ns();
-	if (hda)
-		ret = ae9_clock_diag_hda_read(spec, seq, reg, &raw, &iiscfg);
-	else
-		ret = ae9_clock_diag_read(spec, reg, seq, &raw);
-	end = ktime_get_ns();
-	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
-	if (ret < 0 && ret != -EAGAIN)
-		goto failed;
-	/* A superseded response must never advance the new acquisition. */
-	if (seq != spec->ae9_clock_seq || !spec->ae9_clock_pending ||
-	    !spec->ae9_acm_active || spec->ae9_acm_removing)
-		goto done;
-	if (ret == -EAGAIN) {
-		spec->ae9_clock_due = jiffies +
-			msecs_to_jiffies(AE9_CLOCK_GAP_MS);
-		goto done;
-	}
-	if (!step) {
-		spec->ae9_clock_flags_before = raw;
-		spec->ae9_clock_iiscfg_before = iiscfg;
-	} else if (step == AE9_CLOCK_STEP_COUNT - 1) {
-		spec->ae9_clock_flags_after = raw;
-		spec->ae9_clock_iiscfg_after = iiscfg;
-	} else if (step < AE9_CLOCK_SYS_BEFORE) {
-		spec->ae9_clock_pmu[step - 1] = raw;
-	} else if (step == AE9_CLOCK_SYS_BEFORE) {
-		spec->ae9_clock_sys_before = raw;
-	} else if (step == AE9_CLOCK_SYS_AFTER) {
-		spec->ae9_clock_sys_after = raw;
-	} else {
-		spec->ae9_clock_value[dac_index] = raw;
-		spec->ae9_clock_raw[dac_index] = raw;
-	}
-	if (!hda && (step == AE9_CLOCK_DAC_FIRST + 3 ||
-		     step == AE9_CLOCK_DAC_FIRST + 8) &&
-	    ((raw & 0xfc) != 0x70 || !(raw & 1))) {
-		ret = -ENOLCK;
-		goto failed;
-	}
-	if (step == AE9_CLOCK_DAC_FIRST + 4) {
-		spec->ae9_clock_sample_begin = begin;
-		spec->ae9_clock_sample_end = end;
-	}
-	spec->ae9_clock_step++;
-	spec->ae9_clock_due = jiffies + msecs_to_jiffies(AE9_CLOCK_GAP_MS);
-	if (spec->ae9_clock_step == AE9_CLOCK_STEP_COUNT) {
-		memcpy(value, spec->ae9_clock_value, sizeof(value));
-		memcpy(raw_value, spec->ae9_clock_raw, sizeof(raw_value));
-		memcpy(pmu, spec->ae9_clock_pmu, sizeof(pmu));
-		sys_before = spec->ae9_clock_sys_before;
-		sys_after = spec->ae9_clock_sys_after;
-		iis_before = spec->ae9_clock_iiscfg_before;
-		iis_after = spec->ae9_clock_iiscfg_after;
-		flags_before = spec->ae9_clock_flags_before;
-		flags_after = spec->ae9_clock_flags_after;
-		dpll = (u32)value[4] | (u32)value[5] << 8 |
-			(u32)value[6] << 16 | (u32)value[7] << 24;
-		if (!dpll || dpll == ~0U) {
-			ret = -ERANGE;
-			goto failed;
-		}
-		format = spec->ae9_clock_format;
-		sample_begin = spec->ae9_clock_sample_begin;
-		sample_end = spec->ae9_clock_sample_end;
-		spec->ae9_clock_pending = false;
-		complete = true;
-	}
-done:
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	if (complete)
-		codec_info(spec->codec,
-			   "AE-9 CLOCK seq=%u hda_format=%04x input=%02x mode=%02x dpll_cfg=%02x status_before=%02x dpll=%08x status_after=%02x sample_begin_ns=%llu sample_end_ns=%llu raw=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x sys_before=%08x sys_after=%08x iiscfg_before=%08x iiscfg_after=%08x flags_before=%08x flags_after=%08x pmu=%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
-			   seq, format, value[0], value[1], value[2], value[3],
-			   dpll, value[8], (unsigned long long)sample_begin,
-			   (unsigned long long)sample_end,
-			   raw_value[0], raw_value[1], raw_value[2], raw_value[3],
-			   raw_value[4], raw_value[5], raw_value[6], raw_value[7],
-			   raw_value[8], sys_before, sys_after, iis_before, iis_after,
-			   flags_before, flags_after, pmu[0], pmu[1], pmu[2], pmu[3],
-			   pmu[4], pmu[5], pmu[6]);
-	return;
-failed:
-	spec->ae9_clock_pending = false;
-	spec->ae9_clock_failed = true;
-	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
-	codec_warn(spec->codec,
-		   "AE-9 CLOCK failed seq=%u reg=%02x err=%d raw=%08x; diagnostic stopped\n",
-		   seq, reg, ret, raw);
 }
 
 /* AE-9 UART transports: keep maintenance and trial TX paths distinct. */
@@ -13064,7 +12581,7 @@ static bool ae9_acm_init(struct hda_codec *codec)
 
 /*
  * Execute the selected ACM job. Only service jobs advance the maintenance
- * tick and send GPIO 5 keepalive; knob/display/clock jobs do not consume a
+ * tick and send GPIO 5 keepalive; knob/display jobs do not consume a
  * service tick. The 500/50 ms service delays are measured after completion,
  * so UART waits and workqueue scheduling add to the elapsed interval.
  */
@@ -13076,16 +12593,10 @@ static void ae9_acm_work_fn(struct work_struct *work)
 	bool turbo = spec->ae9_acm_turbo > 0;
 	enum ae9_acm_job job;
 
-	ae9_clock_diag_expire(spec);
 	job = ae9_acm_begin_work(spec);
 
 	if (job == AE9_ACM_JOB_NONE)
 		return;
-	if (job == AE9_ACM_JOB_CLOCK) {
-		ae9_clock_diag_step(spec);
-		ae9_acm_finish_work(spec, 0);
-		return;
-	}
 	if (job == AE9_ACM_JOB_DISPLAY) {
 		if (ae9_acm_take_display(spec))
 			ae9_acm_show_volume(spec);
