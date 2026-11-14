@@ -1167,6 +1167,7 @@ struct ae9_voice_state {
 	struct ae9_voice_config applied;
 	bool applied_valid;
 	bool gain_valid;
+	bool boost_dirty; /* Retry until both input amp channels are updated. */
 	bool route;
 	bool prepared;
 	bool touched;
@@ -6490,14 +6491,51 @@ static int ca0132_mic_boost_set(struct hda_codec *codec, long val)
 	return ca0132_alt_mic_boost_set(codec, val ? 3 : 0);
 }
 
+static int ae9_mic_boost_reapply(struct hda_codec *codec, long val)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int channel, reg, value;
+	int err;
+
+	/* A failed write can leave regmap's cache ahead of the hardware. */
+	for (channel = 0; channel < 2; channel++) {
+		reg = snd_hdac_regmap_encode_amp(spec->input_pins[0], channel,
+						 HDA_INPUT, 0);
+		err = snd_hdac_regmap_read_raw(&codec->core, reg, &value);
+		if (err < 0)
+			return err;
+		value = (value & ~HDA_AMP_VOLMASK) |
+			((unsigned int)val & HDA_AMP_VOLMASK);
+		err = snd_hdac_regmap_write_raw(&codec->core, reg, value);
+		if (err < 0)
+			return err;
+	}
+	spec->ae9_voice.boost_dirty = false;
+	return 1;
+}
+
 static int ca0132_alt_mic_boost_set(struct hda_codec *codec, long val)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int ret = 0;
+	int ret, err;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		if (spec->ae9_voice.boost_dirty)
+			return ae9_mic_boost_reapply(codec, val);
+		spec->ae9_voice.boost_dirty = true;
+	}
 	ret = snd_hda_codec_amp_update(codec, spec->input_pins[0], 0,
 				HDA_INPUT, 0, HDA_AMP_VOLMASK, val);
-	return ret;
+	if (ret < 0 || ca0132_quirk(spec) != QUIRK_AE9)
+		return ret;
+
+	/* Windows programs both AE-9 input amp channels with the same boost. */
+	err = snd_hda_codec_amp_update(codec, spec->input_pins[0], 1,
+				       HDA_INPUT, 0, HDA_AMP_VOLMASK, val);
+	if (err < 0)
+		return err;
+	spec->ae9_voice.boost_dirty = false;
+	return ret | err;
 }
 
 static int ae5_headphone_gain_set(struct hda_codec *codec, long val)
@@ -9083,7 +9121,9 @@ static int ae9_voice_boost_put(struct hda_codec *codec, unsigned int boost)
 	if (pm.err < 0)
 		return pm.err;
 	guard(mutex)(&spec->ae9_voice.mutex);
-	if (boost == spec->mic_boost_enum_val)
+	/* An earlier failure may have left the channels at different levels. */
+	if (boost == spec->mic_boost_enum_val &&
+	    !spec->ae9_voice.boost_dirty)
 		return 0;
 	if (spec->ae9_voice.suspended)
 		return -EIO;
