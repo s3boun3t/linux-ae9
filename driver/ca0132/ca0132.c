@@ -11152,20 +11152,13 @@ static int ae9_validate_overlay(const struct firmware *fw)
 	return 0;
 }
 
-static int ae9_dsp_scp_startup(struct hda_codec *codec)
+static int ae9_dsp_mc_set_state(struct hda_codec *codec, unsigned int state)
 {
-	struct ca0132_spec *spec = codec->spec;
-	static const unsigned int seq[] = { 4, 5, 0 };
-	const struct firmware *ovl_fw = NULL;
-	const u32 *overlay;
-	unsigned int val, reply, reply_len, rb = 0;
-	u32 *ld = NULL;
-	bool overlay_started = false;
-	int i, j, err;
+	unsigned int reply, reply_len;
+	int i, err;
 
-	val = 3;
-	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val,
-			sizeof(val), NULL, NULL);
+	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &state,
+			sizeof(state), NULL, NULL);
 	if (err < 0)
 		return err;
 	for (i = 0; i < 2; i++) {
@@ -11177,8 +11170,28 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 			return err;
 		if (reply_len != sizeof(reply))
 			return -EPROTO;
-		codec_info(codec, "AE-9: MC state 3 GET%d -> %08x\n", i, reply);
+		/* Replies are asynchronous; do not require reply == state. */
+		codec_info(codec, "AE-9: MC state %u GET%d -> %08x\n",
+			   state, i, reply);
 	}
+
+	return 0;
+}
+
+static int ae9_dsp_scp_startup(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	static const unsigned int seq[] = { 4, 5, 0 };
+	const struct firmware *ovl_fw = NULL;
+	const u32 *overlay;
+	unsigned int val, rb = 0;
+	u32 *ld = NULL;
+	bool overlay_started = false;
+	int i, err;
+
+	err = ae9_dsp_mc_set_state(codec, 3);
+	if (err < 0)
+		return err;
 
 	/*
 	 * Output-connect overlay: Windows DMA-loads a small XRAM image to
@@ -11272,26 +11285,9 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 		goto out;
 
 	for (i = 0; i < ARRAY_SIZE(seq); i++) {
-		val = seq[i];
-		err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val,
-				sizeof(val), NULL, NULL);
+		err = ae9_dsp_mc_set_state(codec, seq[i]);
 		if (err < 0)
 			goto out;
-		for (j = 0; j < 2; j++) {
-			reply_len = sizeof(reply);
-			reply = 0xdeadbeef;
-			err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET,
-					NULL, 0, &reply, &reply_len);
-			if (err < 0)
-				goto out;
-			if (reply_len != sizeof(reply)) {
-				err = -EPROTO;
-				goto out;
-			}
-			/* Replies are asynchronous; do not require reply == val. */
-			codec_info(codec, "AE-9: MC state %u GET%d -> %08x\n",
-				   seq[i], j, reply);
-		}
 	}
 
 	err = chipio_write(codec, 0x100e34, 0xf1000000);
