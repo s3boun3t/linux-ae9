@@ -4293,12 +4293,9 @@ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
 }
 
 /*
- * Special pci region2 commands that are only used by the AE-5. They follow
- * a set format, and require reads at certain points to seemingly 'clear'
- * the response data. My first tests didn't do these reads, and would cause
- * the card to get locked up until the memory was read. These commands
- * seem to work with three distinct values that I've taken to calling group,
- * target-id, and value.
+ * CA0113 region2 commands used by AE-5, AE-7 and AE-9 paths, carrying a
+ * group, target and value. Preserve the existing reads: early tests without
+ * them left the card unresponsive; their exact side effects remain uncertain.
  */
 static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 		unsigned int target, unsigned int value)
@@ -4337,9 +4334,6 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	readl(spec->mem_base + 0x210);
 }
 
-/*
- * This second type of command is used for setting the sound filter type.
- */
 /*
  * AE-9: command-engine I2C READ, transcribed from the Windows BAR2 capture
  * (reference: ae9-20260903-210512.trace.bar2.txt lines 185-220, the first
@@ -4392,6 +4386,7 @@ static unsigned int ca0113_mmio_command_get(struct hda_codec *codec,
 	return val & 0xff;
 }
 
+/* Command variant used by the AE-5/AE-7 sound-filter controls. */
 static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
 		unsigned int group, unsigned int target, unsigned int value)
 {
@@ -6661,10 +6656,8 @@ static int ca0132_alt_bass_redirection_xover_set(struct hda_codec *codec,
 }
 
 /*
- * Below I've added controls to mess with the effect levels, I've only enabled
- * them on the Sound Blaster Z, but they would probably also work on the
- * Chromebook. I figured they were probably tuned specifically for it, and left
- * out for a reason.
+ * Effect-level sliders for codecs using alternative controls.
+ * Their suitability for the generic/Chromebook path remains unverified.
  */
 
 /* Sets DSP effect level from the sliders above the controls */
@@ -7717,9 +7710,8 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
  * Volume related
  */
 /*
- * Sets the internal DSP decibel level to match the DAC for output, and the
- * ADC for input. Currently only the SBZ sets dsp capture volume level, and
- * all alternative codecs set DSP playback volume.
+ * DSP gain handling for the alternative controls. AE-9 capture matches ADC
+ * and DSP gains; playback keeps DSP gains at 0 dB while HDA controls its level.
  */
 /*
  * Earlier playback tests reported a stale module gain persisting until the
@@ -9681,11 +9673,9 @@ static const struct hda_pcm_stream ca0132_pcm_digital_capture = {
 static inline bool ae9_capture_blocked(struct hda_codec *codec)
 {
 	/*
-	 * The AE-9 main codec (0x11020071) routes capture through the DSP and
-	 * opening it hard-locks the machine (2026-09). The secondary codec
-	 * (0x11020072) has a plain HDA ADC behind the rear line-in and S/PDIF
-	 * in; that path is safe and stays available. ae9_capture=1 lifts the
-	 * block on the main codec for experiments.
+	 * A main-codec capture hard lock was reported in 2026-09.
+	 * Main capture is now enabled by default and requires ae9_capture
+	 * and ae9_mic. This guard leaves secondary HDA capture independent.
 	 */
 	if (codec->core.subsystem_id != 0x11020071)
 		return false;
@@ -11183,7 +11173,7 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	 * Announce each segment to the DSP's own loader (0x3a/0x3b), which
 	 * pulls the data from the HDA stream. The main firmware may already
 	 * contain these bytes; its initial download is left unchanged.
-	 * Image layout of ae9_dsp_output_overlay[]: [0..2] seg1 hdr, [3..80]
+	 * File image layout (word offsets): [0..2] seg1 hdr, [3..80]
 	 * 78 words, [81..83] seg2 hdr, [84..104] 21 words, [105..107] term.
 	 * Loader image: seg1 verbatim + seg2 = the 20 words after 0x3f3a0
 	 * (0x3f3a4..), since Windows writes 0x3f3a0 itself by chipio below.
@@ -13650,12 +13640,8 @@ static void sbz_dsp_startup_check(struct hda_codec *codec)
 }
 
 /*
- * This is for the extra volume verbs 0x797 (left) and 0x798 (right). These add
- * extra precision for decibel values. If you had the dB value in floating point
- * you would take the value after the decimal point, multiply by 64, and divide
- * by 2. So for 8.59, it's (59 * 64) / 100. Useful if someone wanted to
- * implement fixed point or floating point dB volumes. For now, I'll set them
- * to 0 just incase a value has lingered from a boot into Windows.
+ * Clear the extra left/right volume fields (0x797/0x798) at startup.
+ * This helper writes zero; it does not implement fractional-dB conversion.
  */
 static void ca0132_alt_vol_setup(struct hda_codec *codec)
 {
@@ -13746,9 +13732,9 @@ static void zxr_pre_dsp_setup(struct hda_codec *codec)
 }
 
 /*
- * These are sent before the DSP is downloaded. Not sure
- * what they do, or if they're necessary. Could possibly
- * be removed. Figure they're better to leave in.
+ * Pre-DSP BAR2 setup includes UART configuration (0xc00-0xc0c; AE-9 ACM).
+ * AE-9 preserves 0x1c state for its second codec. Other register bits and
+ * the need for repeated writes remain uncertain; preserve the sequence.
  */
 static const unsigned int ca0113_mmio_init_address_sbz[] = {
 	0x400, 0x408, 0x40c, 0x01c, 0xc0c, 0xc00, 0xc04, 0xc0c, 0xc0c, 0xc0c,
@@ -14127,14 +14113,9 @@ static int ca0132_init(struct hda_codec *codec)
 	}
 
 	/*
-	 * If the DSP is already downloaded, and init has been entered again,
-	 * there's only two reasons for it. One, the codec has awaken from a
-	 * suspended state, and in that case dspload_is_loaded will return
-	 * false, and the init will be ran again. The other reason it gets
-	 * re entered is on startup for some reason it triggers a suspend and
-	 * resume state. In this case, it will check if the DSP is downloaded,
-	 * and not run the init function again. For codecs using alt_functions,
-	 * it will check if the DSP is loaded properly.
+	 * Recheck the loaded marker before reusing a downloaded DSP image.
+	 * A missing marker requests a reload. Otherwise SBZ runs its startup
+	 * check; AE-9 restores routes and restarts ACM service on success.
 	 */
 	if (spec->dsp_state == DSP_DOWNLOADED) {
 		dsp_loaded = dspload_is_loaded(codec);
