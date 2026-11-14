@@ -10602,6 +10602,24 @@ static void ae7_post_dsp_asi_setup(struct hda_codec *codec)
 	ae7_post_dsp_asi_setup_ports(codec);
 }
 
+/* Output/input effects and VoiceFX; AE-9 stops on the first error. */
+static int ca0132_init_effect_defaults(struct hda_codec *codec,
+				       bool stop_on_error)
+{
+	int idx, i, err;
+
+	for (idx = 0; idx < OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1; idx++) {
+		for (i = 0; i <= ca0132_effects[idx].params; i++) {
+			err = dspio_set_uint_param(codec, ca0132_effects[idx].mid,
+						   ca0132_effects[idx].reqs[i],
+						   ca0132_effects[idx].def_vals[i]);
+			if (stop_on_error && err < 0)
+				return err;
+		}
+	}
+	return 0;
+}
+
 /*
  * Setup default parameters for DSP
  */
@@ -10609,21 +10627,11 @@ static void ca0132_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
-	int num_fx;
-	int idx, i;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return;
 
-	/* out, in effects + voicefx */
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			dspio_set_uint_param(codec, ca0132_effects[idx].mid,
-					     ca0132_effects[idx].reqs[i],
-					     ca0132_effects[idx].def_vals[i]);
-		}
-	}
+	ca0132_init_effect_defaults(codec, false);
 
 	/*remove DSP headroom*/
 	tmp = FLOAT_ZERO;
@@ -10654,8 +10662,6 @@ static void r3d_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
-	int num_fx;
-	int idx, i;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return;
@@ -10685,15 +10691,7 @@ static void r3d_setup_defaults(struct hda_codec *codec)
 	}
 
 	/* Setup effect defaults */
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			dspio_set_uint_param(codec,
-					ca0132_effects[idx].mid,
-					ca0132_effects[idx].reqs[i],
-					ca0132_effects[idx].def_vals[i]);
-		}
-	}
+	ca0132_init_effect_defaults(codec, false);
 }
 
 /*
@@ -10704,8 +10702,6 @@ static void sbz_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
-	int num_fx;
-	int idx, i;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return;
@@ -10738,15 +10734,7 @@ static void sbz_setup_defaults(struct hda_codec *codec)
 	ca0132_alt_dsp_initial_mic_setup(codec);
 
 	/* out, in effects + voicefx */
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			dspio_set_uint_param(codec,
-					ca0132_effects[idx].mid,
-					ca0132_effects[idx].reqs[i],
-					ca0132_effects[idx].def_vals[i]);
-		}
-	}
+	ca0132_init_effect_defaults(codec, false);
 
 	ca0132_alt_init_speaker_tuning(codec);
 }
@@ -10758,8 +10746,6 @@ static void ae5_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
-	int num_fx;
-	int idx, i;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return;
@@ -10803,15 +10789,7 @@ static void ae5_setup_defaults(struct hda_codec *codec)
 	ae5_post_dsp_startup_data(codec);
 
 	/* out, in effects + voicefx */
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			dspio_set_uint_param(codec,
-					ca0132_effects[idx].mid,
-					ca0132_effects[idx].reqs[i],
-					ca0132_effects[idx].def_vals[i]);
-		}
-	}
+	ca0132_init_effect_defaults(codec, false);
 
 	ca0132_alt_init_speaker_tuning(codec);
 }
@@ -12717,7 +12695,7 @@ static int ae9_dsp_output_connect(struct hda_codec *codec)
 static int ae9_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int num_fx, idx, i, err;
+	int idx, i, err;
 	const char *stage = "master-control/overlay";
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
@@ -12753,17 +12731,9 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 
 	/* W10: effects + speaker-tuning defaults, as Windows does after unmute */
 	stage = "effect defaults";
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			err = dspio_set_uint_param(codec,
-						   ca0132_effects[idx].mid,
-						   ca0132_effects[idx].reqs[i],
-						   ca0132_effects[idx].def_vals[i]);
-			if (err < 0)
-				goto fail;
-		}
-	}
+	err = ca0132_init_effect_defaults(codec, true);
+	if (err < 0)
+		goto fail;
 	ca0132_alt_init_speaker_tuning(codec);
 	stage = "EQ bypass";
 	err = dspio_set_uint_param(codec, 0x8f, 0x01, FLOAT_ZERO);
@@ -12804,8 +12774,6 @@ static void ae7_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp;
-	int num_fx;
-	int idx, i;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return;
@@ -12867,15 +12835,7 @@ static void ae7_setup_defaults(struct hda_codec *codec)
 	ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x80);
 
 	/* out, in effects + voicefx */
-	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++) {
-		for (i = 0; i <= ca0132_effects[idx].params; i++) {
-			dspio_set_uint_param(codec,
-					ca0132_effects[idx].mid,
-					ca0132_effects[idx].reqs[i],
-					ca0132_effects[idx].def_vals[i]);
-		}
-	}
+	ca0132_init_effect_defaults(codec, false);
 
 	ca0132_alt_init_speaker_tuning(codec);
 }
