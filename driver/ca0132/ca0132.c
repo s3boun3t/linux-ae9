@@ -10883,6 +10883,16 @@ static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned in
 	spec->ae9_dac_reg7 = val;
 }
 
+/* Clear the THD-related registers, including 0x19 = 0x00. */
+static void ae9_dac_clear_thd(struct hda_codec *codec)
+{
+	ae9_dac_write(codec, 0x0d, 0x00);
+	ae9_dac_write(codec, 0x16, 0x00);
+	ae9_dac_write(codec, 0x17, 0x00);
+	ae9_dac_write(codec, 0x18, 0x00);
+	ae9_dac_write(codec, 0x19, 0x00);	/* Windows: 0x00 (ops:2213/6391/6537) */
+}
+
 static void ae9_dev49_write(struct hda_codec *codec, unsigned int reg, unsigned int val)
 {
 	ca0113_mmio_command_set(codec, 0x49, reg, val);
@@ -11074,12 +11084,7 @@ static void ae9_post_dsp_finish(struct hda_codec *codec)
 	ae9_dev49_write(codec, 0x05, 0x15);
 	ae9_dev49_write(codec, 0x02, 0x15);
 	ae9_dev49_write(codec, 0x03, 0x15);
-	/* Clear the THD-related registers, including 0x19 = 0x00. */
-	ae9_dac_write(codec, 0x0d, 0x00);
-	ae9_dac_write(codec, 0x16, 0x00);
-	ae9_dac_write(codec, 0x17, 0x00);
-	ae9_dac_write(codec, 0x18, 0x00);
-	ae9_dac_write(codec, 0x19, 0x00);	/* Windows: 0x00 (ops:2213/6391/6537) */
+	ae9_dac_clear_thd(codec);
 }
 
 /*
@@ -11324,11 +11329,7 @@ static int ae9_dsp_defaults(struct hda_codec *codec)
 		return err;
 
 	/* ES9038 THD table cleared, master trim 0 dB, front muted */
-	ae9_dac_write(codec, 0x0d, 0x00);
-	ae9_dac_write(codec, 0x16, 0x00);
-	ae9_dac_write(codec, 0x17, 0x00);
-	ae9_dac_write(codec, 0x18, 0x00);
-	ae9_dac_write(codec, 0x19, 0x00);
+	ae9_dac_clear_thd(codec);
 	ae9_dac_write(codec, 0x11, 0xff);
 	ae9_dac_write(codec, 0x12, 0xff);
 	ae9_dac_write(codec, 0x13, 0xff);
