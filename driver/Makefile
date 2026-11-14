@@ -1,1 +1,1 @@
-obj-m += hda-core/ ca0132/
+obj-m += hda-core/ hda-codec/ ca0132/

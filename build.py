@@ -165,10 +165,10 @@ def build(args):
     # Cleanup must also target the requested kernel, independently of uname.
     if args.action == 'clean':
         return subprocess.run(command + ['clean'], check=False).returncode
-    version = re.match(r'^(\d+)\.(\d+)\.', release)
-    if not version or not ((7, 0) <= tuple(map(int, version.groups())) <= (7, 3)):
-        raise ValueError('this preview covers Linux 7.0 through 7.3 only')
-    for option in ['CONFIG_SND_HDA_CORE', 'CONFIG_SND_HDA_CODEC_CA0132']:
+    if release != '7.3.3-x64v3-xanmod1':
+        raise ValueError('this ICW candidate requires 7.3.3-x64v3-xanmod1')
+    for option in ['CONFIG_SND_HDA_CORE', 'CONFIG_SND_HDA',
+                   'CONFIG_SND_HDA_CODEC_CA0132']:
         if config.get(option) != 'm':
             raise ValueError(f'{option}=m required; cannot replace a built-in driver')
     if not (kdir / 'Module.symvers').is_file():

@@ -2,7 +2,7 @@
 
 An ALSA driver for the **Creative Sound Blaster AE-9 PCIe sound card** and
 its external **Audio Control Module (ACM)**. This DKMS preview
-consolidates the AE-9 voice and stability improvements as two DKMS modules: `snd-hda-core` and
+consolidates the AE-9 voice and stability improvements as three DKMS modules: `snd-hda-core`, `snd-hda-codec` and
 `snd-hda-codec-ca0132`.
 
 ## Features
@@ -80,20 +80,27 @@ from the removed clock collector and is not an audio-quality test.
 
 The timeout at boot is not declared resolved. Favorable user reports concern
 specific isolated candidates, including the three-module rirbread1 package.
-This combined two-module codec series has not been qualified on hardware.
+The requested codec-only series was validated separately with two modules.
+This combined experimental HDA package has not been qualified on hardware.
+
+## Experimental HDA stage
+
+This stage is icwrecover1. It retains the exact PCI scope for AE-9 special
+handling. ICW recovery and bounded RIRB rereads are not evidence that the
+initial timeout is fixed. No earlyquirk1 refactor is included.
 
 ## Compatibility
 
-This is a **DKMS preview**, version `0.2.0-preview19-codec1`, for **x86_64 Linux
-7.0–7.3** with the expected stable HDA/ALSA APIs. The HDA core and CA0132
-codec must be configured as modules, not built into the kernel.
+This experimental HDA package targets **7.3.3-x64v3-xanmod1 on x86_64 only**.
+It builds the core, common codec/controller and CA0132 modules together.
+Use matching target headers and LLVM 21. Module imports are checked, but
+CONFIG_MODVERSIONS is disabled on this target, so no real CRC validation
+is claimed. Other kernels and other HDA cards remain unqualified.
 
-Both modules have been compiled against Ubuntu `7.0.0-42-generic` and XanMod
-`7.3.3-x64v3-xanmod1`. Fedora, Arch and CachyOS kernels remain unqualified;
-the allowed version range is not a guarantee for every distribution kernel.
-Linux 6.x and the development-kernel adaptations are outside this package.
-The latter are maintained separately on
-[`ae9-mainline`](https://github.com/s3boun3t/linux-ae9/tree/ae9-mainline).
+The retained public CI targets two modules and Ubuntu 7.0. It is unchanged
+in this series and cannot validate this experimental package. A separately
+reviewed CI target and inventory adaptation is required before publishing
+the HDA series to a branch using that workflow.
 
 ## Installation
 
@@ -244,8 +251,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -276,7 +283,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview19-codec1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
