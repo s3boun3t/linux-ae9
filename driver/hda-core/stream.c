@@ -315,9 +315,6 @@ int snd_hdac_stream_setup(struct hdac_stream *azx_dev, bool code_loading)
 	/* upper BDL address */
 	snd_hdac_stream_writel(azx_dev, SD_BDLPU,
 			       upper_32_bits(azx_dev->bdl.addr + bus->addr_offset));
-	/* flush the burst of posted writes (see azx_int_clear) */
-	if (hdac_bus_needs_posted_flush(bus))
-		snd_hdac_stream_readl(azx_dev, SD_BDLPU);
 
 	/* enable the position buffer */
 	if (bus->use_posbuf && bus->posbuf.addr) {

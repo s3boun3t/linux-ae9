@@ -1,7 +1,7 @@
 {
-  "driver_reference": "Codec series plus experimental HDA stage core7331",
+  "driver_reference": "Codec series plus experimental HDA stage bdlflush1",
   "reference_commit": "fd2404434e42d6eaebaf9e90267103b6e47eaae7",
-  "codec_sha256": "eef319579264f5837aed813ad57c884add5ad152e2bf1a1c7ddbb26a8868b1d0",
+  "codec_sha256": "e7df0ec2e46aef2d9dabd6377180017309d558120538572a816f491d5b453a9d",
   "hda_core_reference": "XanMod 7.3.3 source, commit 2ef81154eee5e08d29749ce752a39fb10b8426d7, with reviewed AE-9 differences",
   "development_kernel_adaptations": false,
   "status": "Experimental local HDA preparation; target 7.3.3-x64v3-xanmod1; hardware qualification and compatible public CI pending",
@@ -10,11 +10,11 @@
   "stability1_codec_sha256": "6f79fb26ae55d1d97dd9b87f762e9aa7a20aaa45be7c5186a552d19cbc2e5efe",
   "stability2_tested_codec_sha256": "8d7ed379b00c0baad27597cb255dda291250195f89b28b29408cc723c1279fac",
   "packaging_revision": "Three coherent modules for the exact pinned kernel; do not mix with codec-only package",
-  "package_version": "0.2.0-preview21-hda-core7331",
+  "package_version": "0.2.0-preview22-hda-bdl1",
   "source_scope": "Five requested historical HDA changes only; earlyquirk1 excluded",
   "hda_core_sha256": "2002e09d8ae2aed49b9a8830c6a403f76faa045d425296fc12a63a0ffc02ced3",
   "hda_common_controller_sha256": "6cfecb893fb6207be1e3577495b6808a47fa3825b4ada843401fd0ea470d0735",
   "ci_compatible": false,
-  "hda_stage": "core7331",
+  "hda_stage": "bdlflush1",
   "published_base_commit": "684ea5f46c3d5e92837336f3c1458b2e6c963857"
 }
