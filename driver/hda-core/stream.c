@@ -364,7 +364,7 @@ void snd_hdac_stream_cleanup(struct hdac_stream *azx_dev)
 	snd_hdac_stream_writel(azx_dev, SD_BDLPL, 0);
 	snd_hdac_stream_writel(azx_dev, SD_BDLPU, 0);
 	snd_hdac_stream_writel(azx_dev, SD_CTL, 0);
-	/* flush the burst of posted writes (see azx_int_clear) */
+	/* Flush the posted cleanup writes before returning. */
 	if (hdac_bus_needs_posted_flush(azx_dev->bus))
 		snd_hdac_stream_readl(azx_dev, SD_CTL);
 	azx_dev->bufsize = 0;

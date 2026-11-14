@@ -608,10 +608,6 @@ static void azx_int_clear(struct hdac_bus *bus)
 
 	/* clear int status */
 	snd_hdac_chip_writel(bus, INTSTS, AZX_INT_CTRL_EN | AZX_INT_ALL_STREAM);
-
-	/* flush the burst of posted writes before touching the CORB/RIRB */
-	if (hdac_bus_needs_posted_flush(bus))
-		snd_hdac_chip_readl(bus, INTSTS);
 }
 
 /**
