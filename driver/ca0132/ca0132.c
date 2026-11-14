@@ -2293,12 +2293,29 @@ static void chipio_enable_clocks(struct hda_codec *codec)
 static int dspio_send(struct hda_codec *codec, unsigned int reg,
 		      unsigned int data)
 {
-	int res;
+	struct ca0132_spec *spec = codec->spec;
+	bool ae9_scp_write = ca0132_quirk(spec) == QUIRK_AE9 &&
+		(reg == VENDOR_DSPIO_SCP_WRITE_DATA_LOW ||
+		 reg == VENDOR_DSPIO_SCP_WRITE_DATA_HIGH);
+	unsigned int status;
+	int res, err;
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 
 	/* send bits of data specified by reg to dsp */
 	do {
-		res = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0, reg, data);
+		if (ae9_scp_write) {
+			/* An HDA error does not prove the half-word was rejected. */
+			err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL,
+					    reg, data, &status);
+			if (err < 0)
+				return err;
+			if (status > VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+				return -EIO;
+			res = status;
+		} else {
+			res = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
+						 reg, data);
+		}
 		if ((res >= 0) && (res != VENDOR_STATUS_DSPIO_BUSY))
 			return res;
 		msleep(20);
