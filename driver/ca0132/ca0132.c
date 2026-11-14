@@ -1214,6 +1214,9 @@ struct ca0132_spec {
 	enum dsp_download_state dsp_state;
 	/* AE-9: one SCP failure diagnostic per main firmware load attempt. */
 	unsigned long ae9_dsp_error_logged;
+	/* Protected by ae9_scp_mutex; only a confirmed DSP reset clears it. */
+	bool ae9_scp_desynced;
+	bool ae9_scp_word_started;
 	unsigned int dsp_stream_id;
 	unsigned int wait_scp;
 	unsigned int wait_scp_header;
@@ -2359,11 +2362,15 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 	unsigned long timeout;
 	int status;
 
+	if (ae9)
+		spec->ae9_scp_word_started = false;
 	status = dspio_write_wait(codec);
 	if (status < 0)
 		return status;
 
 	guard(mutex)(&spec->chipio_mutex);
+	if (ae9)
+		spec->ae9_scp_word_started = true;
 	status = dspio_send(codec, VENDOR_DSPIO_SCP_WRITE_DATA_LOW,
 			    scp_data & 0xffff);
 	if (status < 0)
@@ -2389,8 +2396,10 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 			return status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL ?
 				-EIO : 0;
 		if (status == VENDOR_STATUS_DSPIO_OK ||
-		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY) {
+			spec->ae9_scp_word_started = false;
 			return 0;
+		}
 		if (status != VENDOR_STATUS_DSPIO_BUSY)
 			return -EIO;
 		usleep_range(1000, 1500);
@@ -2405,11 +2414,16 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 static int dspio_write_multiple(struct hda_codec *codec,
 				unsigned int *buffer, unsigned int size)
 {
+	struct ca0132_spec *spec = codec->spec;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
 	int status = 0;
 	unsigned int count;
 
 	if (buffer == NULL)
 		return -EINVAL;
+
+	if (ae9 && spec->ae9_scp_desynced)
+		return -EPIPE;
 
 	count = 0;
 	while (count < size) {
@@ -2417,6 +2431,14 @@ static int dspio_write_multiple(struct hda_codec *codec,
 		if (status != 0)
 			break;
 		count++;
+	}
+
+	if (ae9 && status < 0 && (count || spec->ae9_scp_word_started)) {
+		/* Never feed a new header into an unfinished or uncertain word. */
+		spec->ae9_scp_desynced = true;
+		codec_err(codec,
+			  "AE-9: SCP interrupted after %u/%u words (%d); blocked until DSP reset\n",
+			  count, size, status);
 	}
 
 	return status;
@@ -3010,8 +3032,9 @@ static int dsp_set_run_state(struct hda_codec *codec)
 /*
  * Reset the DSP
  */
-static int dsp_reset(struct hda_codec *codec)
+static int __dsp_reset(struct hda_codec *codec)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int res;
 	int retry = 20;
 
@@ -3026,7 +3049,23 @@ static int dsp_reset(struct hda_codec *codec)
 		return -EIO;
 	}
 
+	if (ca0132_quirk(spec) == QUIRK_AE9 && res == VENDOR_STATUS_DSPIO_OK) {
+		spec->ae9_scp_desynced = false;
+		spec->ae9_scp_word_started = false;
+	}
+
 	return 0;
+}
+
+static int dsp_reset(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->ae9_scp_mutex);
+		return __dsp_reset(codec);
+	}
+	return __dsp_reset(codec);
 }
 
 /*
@@ -6456,14 +6495,24 @@ static int ae9_outfx_switch_set(struct hda_codec *codec, hda_nid_t nid,
 				long value)
 {
 	struct ca0132_spec *spec = codec->spec;
+	long old;
+	int err;
 
 	guard(mutex)(&spec->ae9_output_mutex);
+	old = spec->effects_switch[nid - EFFECT_START_NID];
 	WRITE_ONCE(spec->effects_switch[nid - EFFECT_START_NID], value);
-	if (nid == PLAY_ENHANCEMENT) {
-		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
-		return __ca0132_pe_switch_set(codec);
+	if (nid == PLAY_ENHANCEMENT)
+		err = __ca0132_pe_switch_set(codec);
+	else
+		err = ca0132_effects_set(codec, nid, value);
+	if (err < 0) {
+		/* Retain the last successful request, not a hardware readback. */
+		WRITE_ONCE(spec->effects_switch[nid - EFFECT_START_NID], old);
+		return err;
 	}
-	return ca0132_effects_set(codec, nid, value);
+	if (nid == PLAY_ENHANCEMENT)
+		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
+	return err;
 }
 
 /* Check if Mic1 is streaming, if so, stop streaming */
@@ -12208,6 +12257,8 @@ static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 {
 	struct ca0132_spec *spec = codec->spec;
 	struct snd_kcontrol *kctl;
+	bool old;
+	int err;
 
 	if (!ms)
 		return;
@@ -12216,11 +12267,20 @@ static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 		return;
 	}
 	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		old = ae9_fx_enabled(spec);
 		WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID],
-			   !ae9_fx_enabled(spec));
+			   !old);
+		err = __ca0132_pe_switch_set(codec);
+		if (err < 0) {
+			WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT -
+						       EFFECT_START_NID], old);
+			codec_warn(codec,
+				   "AE-9 ACM: SBX update failed: %d; DSP effects may be partial\n",
+				   err);
+			return;
+		}
 		codec_info(codec, "AE-9 ACM: SBX button (%d ms) -> OutFX %s\n", ms,
 			   ae9_fx_enabled(spec) ? "on" : "off");
-		__ca0132_pe_switch_set(codec);
 		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
 	}
 	kctl = snd_hda_find_mixer_ctl(codec, "Enable OutFX Playback Switch");
