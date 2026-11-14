@@ -6400,6 +6400,7 @@ static int __ca0132_pe_switch_set(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	hda_nid_t nid;
+	unsigned int tmp;
 	int i, err, ret = 0;
 
 	if (ca0132_quirk(spec) == QUIRK_AE9)
@@ -6409,10 +6410,19 @@ static int __ca0132_pe_switch_set(struct hda_codec *codec)
 		    spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID]);
 
 	if (ca0132_use_alt_functions(spec)) {
-		if (ca0132_quirk(spec) == QUIRK_AE9)
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    spec->cur_out_type == HEADPHONE_OUT &&
+		    spec->ae9_output_applied &&
+		    spec->dsp_state == DSP_DOWNLOADED) {
+			/* SBX changes effects, not the applied headphone route. */
+			tmp = spec->effects_switch[PLAY_ENHANCEMENT -
+					   EFFECT_START_NID] ? FLOAT_ONE : FLOAT_ZERO;
+			err = dspio_set_uint_param(codec, 0x80, 0x04, tmp);
+		} else if (ca0132_quirk(spec) == QUIRK_AE9) {
 			err = __ca0132_alt_select_out(codec);
-		else
+		} else {
 			err = ca0132_alt_select_out(codec);
+		}
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
 	}
