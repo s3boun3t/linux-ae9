@@ -1479,6 +1479,24 @@ static const struct hda_pintbl ae5_pincfgs[] = {
 	{}
 };
 
+/*
+ * AE-9 logical topology. Keep the ACM headphone route for ALSA; optical
+ * I/O is provided by the secondary codec, not the primary digital pins.
+ */
+static const struct hda_pintbl ae9_pincfgs[] = {
+	{ 0x0b, 0x01017010 }, /* Front L/R */
+	{ 0x0c, 0x414510f0 }, /* Primary digital output, not connected */
+	{ 0x0d, 0x414510f0 }, /* Primary digital output, not connected */
+	{ 0x0e, 0x01c510f0 },
+	{ 0x0f, 0x01017114 }, /* Rear L/R */
+	{ 0x10, 0x01017012 }, /* Center/LFE */
+	{ 0x11, 0x012170ff }, /* Logical ACM headphone route */
+	{ 0x12, 0x01a170f0 }, /* Microphone / line input */
+	{ 0x13, 0x908700f0 }, /* What U Hear */
+	{ 0x18, 0x50d000f0 },
+	{}
+};
+
 /* Recon3D integrated pin configs taken from Windows Driver */
 static const struct hda_pintbl r3di_pincfgs[] = {
 	{ 0x0b, 0x01014110 }, /* Port G -- Lineout FRONT L/R */
@@ -14210,7 +14228,14 @@ static int ca0132_init(struct hda_codec *codec)
 	for (i = 0; i < spec->num_outputs; i++)
 		init_output(codec, spec->out_pins[i], spec->dacs[0]);
 
-	init_output(codec, cfg->dig_out_pins[0], spec->dig_out);
+	/*
+	 * Keep the pre-topology AE-9 widget initialization while the primary
+	 * S/PDIF is hidden from ALSA.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		init_output(codec, 0x0c, 0x05);
+	else
+		init_output(codec, cfg->dig_out_pins[0], spec->dig_out);
 
 	for (i = 0; i < spec->num_inputs; i++)
 		init_input(codec, spec->input_pins[i], spec->adcs[i]);
@@ -14388,8 +14413,8 @@ static void ca0132_config(struct hda_codec *codec)
 		snd_hda_apply_pincfgs(codec, ae5_pincfgs);
 		break;
 	case QUIRK_AE9:
-		codec_dbg(codec, "%s: QUIRK_AE9 applied (AE-5 pin configs).\n", __func__);
-		snd_hda_apply_pincfgs(codec, ae5_pincfgs);
+		codec_dbg(codec, "%s: QUIRK_AE9 applied.\n", __func__);
+		snd_hda_apply_pincfgs(codec, ae9_pincfgs);
 		break;
 	case QUIRK_AE7:
 		codec_dbg(codec, "%s: QUIRK_AE7 applied.\n", __func__);
@@ -14498,8 +14523,10 @@ static void ca0132_config(struct hda_codec *codec)
 		spec->unsol_tag_amic1 = spec->input_pins[0];
 
 		/* SPDIF I/O */
-		spec->dig_out = 0x05;
-		spec->multiout.dig_out_nid = spec->dig_out;
+		if (ca0132_quirk(spec) != QUIRK_AE9) {
+			spec->dig_out = 0x05;
+			spec->multiout.dig_out_nid = spec->dig_out;
+		}
 		break;
 	case QUIRK_R3DI:
 		spec->num_outputs = 2;
