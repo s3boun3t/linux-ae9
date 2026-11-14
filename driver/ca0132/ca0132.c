@@ -6487,17 +6487,7 @@ static int ca0132_cvoice_switch_set(struct hda_codec *codec)
 
 static int ca0132_mic_boost_set(struct hda_codec *codec, long val)
 {
-	struct ca0132_spec *spec = codec->spec;
-	int ret = 0;
-
-	if (val) /* on */
-		ret = snd_hda_codec_amp_update(codec, spec->input_pins[0], 0,
-					HDA_INPUT, 0, HDA_AMP_VOLMASK, 3);
-	else /* off */
-		ret = snd_hda_codec_amp_update(codec, spec->input_pins[0], 0,
-					HDA_INPUT, 0, HDA_AMP_VOLMASK, 0);
-
-	return ret;
+	return ca0132_alt_mic_boost_set(codec, val ? 3 : 0);
 }
 
 static int ca0132_alt_mic_boost_set(struct hda_codec *codec, long val)
@@ -8673,14 +8663,6 @@ static int ae9_voice_connections(struct hda_codec *codec, unsigned int rate)
 	return 0;
 }
 
-static int ae9_voice_vip(struct hda_codec *codec, bool on)
-{
-	struct ca0132_spec *spec = codec->spec;
-
-	guard(mutex)(&spec->chipio_mutex);
-	return ae9_voice_param_locked(codec, CONTROL_PARAM_VIP_SOURCE, on);
-}
-
 static int ae9_voice_status(struct hda_codec *codec)
 {
 	u32 status;
@@ -8804,13 +8786,13 @@ static int ae9_voice_route_locked(struct hda_codec *codec, bool on)
 		err = ae9_voice_status(codec);
 		if (err < 0)
 			goto fail;
-		err = ae9_voice_vip(codec, true);
+		err = ae9_control_param(codec, CONTROL_PARAM_VIP_SOURCE, true);
 		if (err < 0)
 			goto fail;
 		/* Windows binds 51-66 ms later in the captures cited by 3xHelix. */
 		msleep(60);
 	} else {
-		err = ae9_voice_vip(codec, false);
+		err = ae9_control_param(codec, CONTROL_PARAM_VIP_SOURCE, false);
 		if (err < 0)
 			goto fail;
 		err = ae9_voice_set(codec, 0x80, 0x05, FLOAT_ZERO);
@@ -10840,11 +10822,6 @@ static void ae9_dev49_write(struct hda_codec *codec, unsigned int reg, unsigned 
 	ca0113_mmio_command_set(codec, 0x49, reg, val);
 }
 
-static void ae9_gpio_cmd(struct ca0132_spec *spec, unsigned int cmd)
-{
-	ca0113_mmio_writew(spec, 0x320, cmd);
-}
-
 /* D0.2: pins, ACM power, anti-pop pulse, mute the DAC before touching clocks */
 static void ae9_post_dsp_d0_prepare(struct hda_codec *codec)
 {
@@ -10854,15 +10831,17 @@ static void ae9_post_dsp_d0_prepare(struct hda_codec *codec)
 	v = readl(spec->mem_base + 0x100);
 	ca0113_mmio_writel(spec, 0x100, v & ~0x0f);	/* pins 4-7: HdGp value 1 */
 	ca0113_mmio_writel(spec, 0x304, 0xff);
-	ae9_gpio_cmd(spec, 0x0105);		/* GPIO 5 = 1: ACM 12 V / external enable */
-	ae9_gpio_cmd(spec, 0x0000);		/* anti-pop pulse on pin 0 */
+	/* GPIO 5 = 1: ACM 12 V / external enable */
+	ca0113_mmio_gpio_set(codec, 5, true);
+	/* anti-pop pulse on pin 0 */
+	ca0113_mmio_gpio_set(codec, 0, false);
 	msleep(1);
-	ae9_gpio_cmd(spec, 0x0100);
+	ca0113_mmio_gpio_set(codec, 0, true);
 	ae9_dac_write(codec, 0x07, 0x81);	/* ES9038: mute (reg7 |= 1) */
 	ae9_dev49_write(codec, 0x0a, 0x07);
-	ae9_gpio_cmd(spec, 0x0002);		/* pin 2 = 0 */
+	ca0113_mmio_gpio_set(codec, 2, false);		/* pin 2 = 0 */
 	ae9_dac_write(codec, 0x1d, 0x40);	/* front unmute state */
-	ae9_gpio_cmd(spec, 0x0103);		/* pin 3 = 1 */
+	ca0113_mmio_gpio_set(codec, 3, true);		/* pin 3 = 1 */
 }
 
 static void ae9_chip_ctrl_725(struct hda_codec *codec)
@@ -10901,8 +10880,6 @@ static void ae9_apply_8051_reg_sequence(struct hda_codec *codec)
 /* D0.3: I2SM Start - the AE-9's ASI / PLL / stream setup (96 kHz, 32-bit, 6 ch) */
 static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 {
-	struct ca0132_spec *spec = codec->spec;
-
 	chipio_set_control_param(codec, 3, 3);
 	chipio_set_control_flag(codec, CONTROL_FLAG_ASI_96KHZ, 1);
 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x724, 0x83);
@@ -10911,15 +10888,17 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 	chipio_8051_write_exram(codec, 0xfa92, 0x22);
 	ae9_apply_8051_reg_sequence(codec);
 	ae9_chip_ctrl_725(codec);
-	ae9_gpio_cmd(spec, 0x0001);		/* GPIO 1 = 0: 192 kHz select off */
+	/* GPIO 1 = 0: 192 kHz select off */
+	ca0113_mmio_gpio_set(codec, 1, false);
 	/*
 	 * Replay the captured 0x105,0x104,0x105 GPIO command order from
 	 * Windows phases 4 and 9. An analog enable/relay role for GPIO4
 	 * remains a hypothesis, not a confirmed signal assignment.
 	 */
-	ae9_gpio_cmd(spec, 0x0105);
-	ae9_gpio_cmd(spec, 0x0104);		/* GPIO 4 = 1 (Windows; analog out enable?) */
-	ae9_gpio_cmd(spec, 0x0105);
+	ca0113_mmio_gpio_set(codec, 5, true);
+	/* GPIO 4 = 1 (Windows; analog out enable?) */
+	ca0113_mmio_gpio_set(codec, 4, true);
+	ca0113_mmio_gpio_set(codec, 5, true);
 
 	chipio_set_conn_rate(codec, 0x70, SR_96_000);
 	/*
@@ -11010,9 +10989,8 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 /* D0.6 / D0.7: captured GPIO4 command, DAC unmute and THD registers */
 static void ae9_post_dsp_finish(struct hda_codec *codec)
 {
-	struct ca0132_spec *spec = codec->spec;
-
-	ae9_gpio_cmd(spec, 0x0104);		/* GPIO4 high, as captured */
+	/* GPIO4 high, as captured */
+	ca0113_mmio_gpio_set(codec, 4, true);
 	ae9_dac_write(codec, 0x07, 0x80);	/* ES9038: unmute */
 	/*
 	 * Windows unmutes the SABRE9006 (dev 0x49, the 8-channel line-out DAC)
@@ -12500,7 +12478,8 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	 */
 	for (attempt = 0; attempt < 3; attempt++) {
 		if (attempt > 0) {
-			ae9_gpio_cmd(spec, 0x0005);	/* GPIO5 low: ACM 12 V off */
+			/* GPIO5 low: ACM 12 V off */
+			ca0113_mmio_gpio_set(codec, 5, false);
 			msleep(1000);
 		}
 		/*
@@ -12509,7 +12488,7 @@ static bool ae9_acm_init(struct hda_codec *codec)
 		 * ES9038/SABRE, so repeating it here wiped W5 and silenced the
 		 * card (2026-09-08). Windows' ACM thread only re-asserts pin 5.
 		 */
-		ae9_gpio_cmd(spec, 0x0105);		/* GPIO5 on */
+		ca0113_mmio_gpio_set(codec, 5, true);		/* GPIO5 on */
 		msleep(attempt ? 400 : 50);		/* MCU needs longer after a cold cycle */
 		for (w = 0; w < 320 && (readb(b2 + AE9_U_STS) & 0x01); w++)
 			usleep_range(900, 1100);
@@ -12599,7 +12578,7 @@ static void ae9_acm_work_fn(struct work_struct *work)
 		return;
 	}
 
-	ae9_gpio_cmd(spec, 0x0105);
+	ca0113_mmio_gpio_set(codec, 5, true);
 	if (READ_ONCE(spec->ae9_acm_tx_failed)) {
 		if (!ae9_acm_poll) {
 			ae9_acm_park(spec);
@@ -13462,14 +13441,14 @@ static void ae9_exit_chip(struct hda_codec *codec)
 	msleep(50);
 
 	/* Windows power-down order, without its controller/secondary writes. */
-	ae9_gpio_cmd(spec, 0x01);
+	ca0113_mmio_gpio_set(codec, 1, false);
 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x724, 0x83);
 	/* Keep the selected filter while asserting soft mute. */
 	ae9_dac_write(codec, 0x07, 0x01);
 	ae9_dev49_write(codec, 0x0a, 0x07);
-	ae9_gpio_cmd(spec, 0x04);
-	ae9_gpio_cmd(spec, 0x05);
-	ae9_gpio_cmd(spec, 0x03);
+	ca0113_mmio_gpio_set(codec, 4, false);
+	ca0113_mmio_gpio_set(codec, 5, false);
+	ca0113_mmio_gpio_set(codec, 3, false);
 
 	for (i = 0x11; i <= 0x14; i++)
 		ae9_dac_write(codec, i, 0x00);
@@ -13480,7 +13459,7 @@ static void ae9_exit_chip(struct hda_codec *codec)
 	ae9_dev49_write(codec, 0x04, 0xff);
 	ae9_dev49_write(codec, 0x03, 0xff);
 	ae9_dev49_write(codec, 0x05, 0xff);
-	ae9_gpio_cmd(spec, 0x00);
+	ca0113_mmio_gpio_set(codec, 0, false);
 	msleep(100);
 
 	for (i = 0; i < ARRAY_SIZE(pins); i++)
