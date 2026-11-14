@@ -85,7 +85,7 @@ This combined experimental HDA package has not been qualified on hardware.
 
 ## Experimental HDA stage
 
-This stage is icwrecover1. It retains the exact PCI scope for AE-9 special
+This stage is core7331. It retains the exact PCI scope for AE-9 special
 handling. ICW recovery and bounded RIRB rereads are not evidence that the
 initial timeout is fixed. No earlyquirk1 refactor is included.
 
@@ -251,8 +251,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview21-hda-core7331 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview21-hda-core7331 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -283,7 +283,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview20-hda-icw1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview21-hda-core7331 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
