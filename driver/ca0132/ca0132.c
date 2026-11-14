@@ -5627,24 +5627,30 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
 
-		/* Disable all speaker nodes. */
+		/* Disable speaker nodes except the AE-9 ACM output. */
 		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[0], 0, 0);
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
-		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[2], 0, 0);
-		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
-			return err;
+		if (ca0132_quirk(spec) != QUIRK_AE9)
+			ca0132_set_out_node_pincfg(codec,
+						   spec->out_pins[2], 0, 0);
 		err = ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 0, 0);
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
 
-		/* enable headphone, either front or rear */
-		if (snd_hda_jack_detect(codec, spec->unsol_tag_front_hp))
-			headphone_nid = spec->out_pins[2];
-		else if (snd_hda_jack_detect(codec, spec->unsol_tag_hp))
-			headphone_nid = spec->out_pins[1];
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			/* The ACM uses physical pin 0x10, not logical pin 0x11. */
+			err = ca0132_set_out_node_pincfg(codec, 0x10, 1, 1);
+		} else {
+			/* Enable headphone, either front or rear. */
+			if (snd_hda_jack_detect(codec, spec->unsol_tag_front_hp))
+				headphone_nid = spec->out_pins[2];
+			else if (snd_hda_jack_detect(codec, spec->unsol_tag_hp))
+				headphone_nid = spec->out_pins[1];
 
-		err = ca0132_set_out_node_pincfg(codec, headphone_nid, 1, 1);
+			err = ca0132_set_out_node_pincfg(codec, headphone_nid,
+							 1, 1);
+		}
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
 			return err;
 
