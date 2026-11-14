@@ -1,7 +1,7 @@
 {
-  "driver_reference": "Codec series plus experimental HDA stage intflush1",
+  "driver_reference": "Codec series plus experimental HDA stage rirbread1",
   "reference_commit": "fd2404434e42d6eaebaf9e90267103b6e47eaae7",
-  "codec_sha256": "8d44b90d54228d592111e4c51f22099225c153358abc650239ac67a264dcaa40",
+  "codec_sha256": "dc72c84d91703175131a157e8bc31078f5f78565a9f0f2ff245c396c3ee2f370",
   "hda_core_reference": "XanMod 7.3.3 source, commit 2ef81154eee5e08d29749ce752a39fb10b8426d7, with reviewed AE-9 differences",
   "development_kernel_adaptations": false,
   "status": "Experimental local HDA preparation; target 7.3.3-x64v3-xanmod1; hardware qualification and compatible public CI pending",
@@ -10,11 +10,11 @@
   "stability1_codec_sha256": "6f79fb26ae55d1d97dd9b87f762e9aa7a20aaa45be7c5186a552d19cbc2e5efe",
   "stability2_tested_codec_sha256": "8d7ed379b00c0baad27597cb255dda291250195f89b28b29408cc723c1279fac",
   "packaging_revision": "Three coherent modules for the exact pinned kernel; do not mix with codec-only package",
-  "package_version": "0.2.0-preview23-hda-int1",
+  "package_version": "0.2.0-preview24-hda-rirb1",
   "source_scope": "Five requested historical HDA changes only; earlyquirk1 excluded",
-  "hda_core_sha256": "0f78969a7b894f5d7623a42bf2d2a2a85bd1c297c0a123556f7b9a74b60445a5",
+  "hda_core_sha256": "ceb5e335b56c2b1df3545d2551e19858532d5e08952b9dfc46f28a6661196c91",
   "hda_common_controller_sha256": "6cfecb893fb6207be1e3577495b6808a47fa3825b4ada843401fd0ea470d0735",
   "ci_compatible": false,
-  "hda_stage": "intflush1",
+  "hda_stage": "rirbread1",
   "published_base_commit": "684ea5f46c3d5e92837336f3c1458b2e6c963857"
 }

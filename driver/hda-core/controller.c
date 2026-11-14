@@ -263,6 +263,9 @@ void snd_hdac_bus_update_rirb(struct hdac_bus *bus)
 {
 	unsigned int rp, wp;
 	unsigned int addr;
+	unsigned int retries = 10;
+	/* The posted-flush selector is the exact AE-9 PCI identity. */
+	bool ae9 = hdac_bus_needs_posted_flush(bus);
 	u32 res, res_ex;
 
 	wp = snd_hdac_chip_readw(bus, RIRBWP);
@@ -280,9 +283,29 @@ void snd_hdac_bus_update_rirb(struct hdac_bus *bus)
 		bus->rirb.rp %= AZX_MAX_RIRB_ENTRIES;
 
 		rp = bus->rirb.rp << 1; /* an RIRB entry is 8-bytes */
-		res_ex = le32_to_cpu(bus->rirb.buf[rp + 1]);
-		res = le32_to_cpu(bus->rirb.buf[rp]);
-		addr = res_ex & 0xf;
+		if (ae9) {
+			const __le32 *entry = &bus->rirb.buf[rp];
+
+			dma_rmb();
+			res_ex = le32_to_cpu(READ_ONCE(entry[1]));
+			res = le32_to_cpu(READ_ONCE(entry[0]));
+			addr = res_ex & 0xf;
+			/* The retry budget is shared by all entries. */
+			while (retries && !(res_ex & AZX_RIRB_EX_UNSOL_EV) &&
+			       (addr >= HDA_MAX_CODECS ||
+				!bus->rirb.cmds[addr])) {
+				udelay(1);
+				retries--;
+				dma_rmb();
+				res_ex = le32_to_cpu(READ_ONCE(entry[1]));
+				res = le32_to_cpu(READ_ONCE(entry[0]));
+				addr = res_ex & 0xf;
+			}
+		} else {
+			res_ex = le32_to_cpu(bus->rirb.buf[rp + 1]);
+			res = le32_to_cpu(bus->rirb.buf[rp]);
+			addr = res_ex & 0xf;
+		}
 		if (addr >= HDA_MAX_CODECS) {
 			dev_err(bus->dev,
 				"spurious response %#x:%#x, rp = %d, wp = %d",
