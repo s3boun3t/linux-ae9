@@ -9276,9 +9276,7 @@ static int ae9_voice_info(struct snd_kcontrol *kcontrol,
 		for (i = 0; i < count; i++)
 			names[i] = ae9_miceq_presets[i].name;
 	} else if (kcontrol->private_value == AE9_VOICE_VOICEFX) {
-		count = ARRAY_SIZE(ca0132_voicefx_presets);
-		for (i = 0; i < count; i++)
-			names[i] = ca0132_voicefx_presets[i].name;
+		return ca0132_voicefx_info(kcontrol, uinfo);
 	} else {
 		return snd_ctl_boolean_mono_info(kcontrol, uinfo);
 	}
