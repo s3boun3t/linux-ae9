@@ -19,7 +19,10 @@ the reference Mint/XanMod system. Microphone jack presence is polled at roughly
 five-second intervals. XLR/TRS detection, surround/optical output and
 suspend/resume are not fully qualified. Experimental Direct stereo playback
 was reported working at 48/192 kHz on the reference machine. This candidate
-changes playback volume and has not been installed or tested on hardware.
+adds live Direct/DSP switching. Preview35 is installed on the reference
+machine; two 48 kHz transitions were observed without a PCM restart, with
+a brief audible interruption. Prolonged, duplex, 96/192 kHz live switching
+and suspend/resume qualification remain incomplete.
 
 The driver keeps the microphone handling and complete
 SCP-message serialization. On AE-9, SCP reads now preserve transport errors
@@ -40,9 +43,8 @@ AE-9 microphone setup, source selection and teardown leave the internal DSP
 streams 3/4 untouched, matching the isolated `voice1` correction tested on the
 reference system. Brief user recordings reported clear NR, VoiceFX, Smart
 Volume and Mic EQ capture, with the played reference suppressed during the
-AEC comparison. This consolidated source adds shared VoiceFX identifiers;
-it has not itself been installed. Prolonged voice sessions and suspend/resume
-remain unqualified. Other CA0132 cards retain their stream 3/4 handling.
+AEC comparison. This consolidated source includes shared VoiceFX identifiers. Prolonged
+voice sessions and suspend/resume remain unqualified. Other CA0132 cards retain their stream 3/4 handling.
 
 Output routing now has a separate applied-state flag. Errors prevent new
 playback preparation and ACM output writes until a complete selection succeeds.
@@ -90,9 +92,14 @@ that separate error has not been explained by a reproduced failure.
 
 `AE-9: Direct Mode Switch` selects stereo playback without the playback DSP
 processing path. It is off by default and is available in alsamixer or
-amixer. Close playback, microphone and What U Hear streams before changing
-it; an open stream makes the change return `-EBUSY`. Desktop audio software
-may keep streams open even when no application is playing.
+amixer. For prepared stereo playback at 48, 96 or 192 kHz, mode changes
+run asynchronously so ALSA control reads can continue feeding the PCM.
+The codec route changes under mute without explicitly restarting the
+controller DMA or changing the negotiated PCM format. This does not yet
+establish uninterrupted hardware playback. A prepared stream
+must use a stereo 24-bit or 32-bit HDA transport at one of these rates;
+other active formats are refused with `-EINVAL` before programming.
+An open What U Hear stream blocks entry to Direct with `-EBUSY`.
 
 Direct playback accepts two channels in `S32_LE` at 48, 96 or 192 kHz.
 Other rates, including 44.1 and 384 kHz, are rejected. The first version
@@ -102,11 +109,29 @@ capture. The negotiated PCM rate and transport format do not demonstrate
 the physical DAC clock or 32-bit analog precision.
 
 Playback effects and EQ become inactive while their saved settings are
-retained. The ACM SBX button is ignored and its LED stays off. Output
-selection, Master volume, mute, the ACM knob and DAC filter remain available.
-The original playback capabilities and saved effects return in DSP mode.
+retained. The SBX LED stays off in Direct. Pressing the ACM SBX button
+returns to DSP and enables SBX, including during playback. In DSP mode
+the button retains its normal SBX on/off behavior. Outside a pending mode
+transition, output selection, Master volume, mute, the ACM knob and DAC
+filter remain available. Saved effects
+return in DSP mode; DSP playback now also admits 192 kHz. The DSP route
+and DAC clock configuration remain at 96 kHz; a 192 kHz ALSA stream is not
+a claim of native 192 kHz DSP processing.
 Transitions are muted; failed programming detaches playback and reports an
 error rather than silently using the DSP path.
+
+During prepared playback, Direct and `Enable OutFX Playback Switch` writes
+accept a request; they do not report completion of the hardware operation.
+The mode and OutFX getters show the accepted request while it is pending.
+Other control reads use snapshots, and concurrent writes return `-EBUSY`
+before entering the virtual Master callbacks. Completion updates the values
+and effect availability and sends ALSA notifications. `AE-9: Last Mode Error`
+reports zero after success or a negative errno after failure; the requested
+mode returns to the retained applied state on failure, without claiming that
+a partially changed hardware route was restored. When no AE-9 PCM stream
+is open or prepared, ALSA mode writes apply immediately to preserve sequential
+`alsactl` restoration. The physical SBX button uses the asynchronous path.
+The transition still mutes the DAC; seamless audible switching is unverified.
 
 Microphone capture and Voice Clarity remain independent. The existing
 `Enable InFX Capture Switch` can disable voice effects, but it is not a
@@ -187,7 +212,7 @@ at startup and after ACM recovery.
 The preceding ACM recovery build was installed on the reference system.
 Automatic reattachment after a configuration loss has not been exercised on
 hardware. The preceding revision corrected and shortened source comments.
-Direct mode keeps the ACM recovery path while suppressing its SBX requests.
+Direct mode keeps the ACM recovery path and supports the SBX shortcut.
 These software guards do not prove that the physical ACM retained all
 settings. The shared HDA sources are unchanged from the preceding
 rirbread1 package.
@@ -200,10 +225,9 @@ Use matching target headers and LLVM 21. Module imports are checked, but
 CONFIG_MODVERSIONS is disabled on this target, so no real CRC validation
 is claimed. Other kernels and other HDA cards remain unqualified.
 
-The retained public CI targets two modules and Ubuntu 7.0. It is unchanged
-in this series and cannot validate this experimental package. A separately
-reviewed CI target and inventory adaptation is required before publishing
-the HDA series to a branch using that workflow.
+No GitHub Actions workflow is enabled in this branch. Local build and
+regression reports are development evidence and are not part of the driver
+package. The three modules must be built for the exact supported kernel.
 
 ## Installation
 
@@ -354,8 +378,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview34-dspref-hold1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview34-dspref-hold1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -386,7 +410,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview34-dspref-hold1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
@@ -448,3 +472,40 @@ reverse engineering and development. Original source notices are retained.
 Crediting these projects does not mean that every feature in their current
 branches is included here. See [COPYING](COPYING) and the source headers for
 licensing information.
+
+## Live switching candidate
+
+The temporary `ae9_dsp192_probe` parameter is removed. DSP playback now
+admits 192 kHz without an opt-in. Preview31's second manual probe completed
+in about four seconds at the expected PCM progression rate, and the user
+heard both channels. Its earlier one-sided timeout remains unexplained.
+These observations do not qualify live switching in this new candidate.
+
+A stream opened without prepared hardware defers routing until prepare.
+Switching does not renegotiate an already open PCM: unsupported formats
+must be closed and reopened. Microphone controls remain independent, but
+concurrent capture and clock transitions still require hardware validation.
+
+## DSP reference lifetime correction candidate
+
+The preview33 hardware trace at 48 kHz showed stream 0x0c dropping from
+one reference to zero immediately after unbinding the HDA input. The slot
+sweep and subsequent DSP restoration then failed because they required
+that allocation to survive. Earlier synthetic models kept it alive.
+
+This candidate takes one verified extra reference before mute or detach.
+It retains that reference across Direct/DSP transitions and PCM cleanup,
+without taking another one on every cycle. Shutdown releases it explicitly;
+full initialization verifies cleanup before resetting the DMA setup. An
+ambiguous reference command blocks further route preparation until verified
+full initialization, rather than retrying increments or guessing ownership.
+
+No fixed DSP ports, controller DMA changes or microphone stream changes are
+introduced. The existing allocation must be present when entering Direct:
+a zero count is refused before destructive work; no reconstruction from
+stale DSP ports is attempted. The inherited counter bound of eight remains
+a conservative guard, not a demonstrated hardware limit.
+
+This is a software-verified candidate only once its local verification
+report passes. Live 48/96/192 kHz, both channels, microphone duplex,
+suspend/resume and removal still need separate hardware qualification.

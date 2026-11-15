@@ -25,6 +25,9 @@
 #include <linux/spinlock.h>
 #include <linux/bitops.h>
 #include <linux/unaligned.h>
+#include <linux/xarray.h>
+#include <linux/refcount.h>
+#include <linux/completion.h>
 
 #include <asm/io.h>
 #include <sound/core.h>
@@ -145,6 +148,7 @@ static bool ae9_mic = true;
 module_param(ae9_mic, bool, 0444);
 MODULE_PARM_DESC(ae9_mic,
 		 "AE-9: initialise the DSP microphone path (default 1)");
+
 
 static const char *const dirstr[2] = { "Playback", "Capture" };
 
@@ -1207,6 +1211,12 @@ struct ae9_direct_state {
 	bool touched;
 	bool valid;
 	bool prepared;
+	bool switching;
+	bool dsp_ref_held;
+	bool dsp_ref_unknown;
+	unsigned int stream_tag;
+	unsigned int stream_format;
+	unsigned int stream_rate;
 	unsigned int opened;
 	unsigned int rate;
 	unsigned int maxbps;
@@ -1217,6 +1227,42 @@ struct ae9_direct_state {
 	u8 dsp_slots[2];
 	u8 dsp_sources[2];
 };
+
+/*
+ * AE-9 only: keep ALSA/vmaster's opaque control context and destructor intact.
+ * The registry maps the outer controls to our snapshots after vmaster setup.
+ */
+enum ae9_mode_action {
+	AE9_MODE_DIRECT,
+	AE9_MODE_SBX_BUTTON,
+	AE9_MODE_OUTFX,
+};
+
+struct ae9_ctl_value {
+	struct snd_ctl_elem_info *info;
+	unsigned int info_count;
+	struct snd_ctl_elem_value value;
+	struct snd_ctl_elem_value next;
+	int error;
+	int next_error;
+};
+
+struct ae9_ctl_proxy {
+	struct list_head list;
+	struct ca0132_spec *spec;
+	struct snd_kcontrol *kctl;
+	snd_kcontrol_info_t *info;
+	snd_kcontrol_get_t *get;
+	snd_kcontrol_put_t *put;
+	unsigned int count;
+	bool effect;
+	bool outfx;
+	refcount_t refs;
+	struct completion released;
+	struct ae9_ctl_value values[];
+};
+
+static DEFINE_XARRAY(ae9_ctl_registry);
 
 struct ca0132_spec {
 	const struct snd_kcontrol_new *mixers[5];
@@ -1321,6 +1367,21 @@ struct ca0132_spec {
 	 * worker use ae9_acm_work_lock for queue/lifecycle state and deadlines.
 	 * The lock is released before I/O or synchronous work cancellation.
 	 */
+	/* mode_lock protects snapshots, request/publication and callback admission. */
+	spinlock_t ae9_mode_lock;
+	struct list_head ae9_mode_controls;
+	struct delayed_work ae9_mode_work;
+	unsigned int ae9_mode_users;
+	bool ae9_mode_active;
+	bool ae9_mode_ready;
+	bool ae9_mode_removing;
+	bool ae9_mode_pending;
+	bool ae9_mode_done;
+	bool ae9_mode_requested;
+	enum ae9_mode_action ae9_mode_action;
+	bool ae9_mode_fx_value;
+	int ae9_mode_error;
+	int ae9_mode_result;
 	struct delayed_work ae9_acm_work; /* ACM service, knob and display */
 	spinlock_t ae9_acm_work_lock;
 	bool ae9_acm_active;
@@ -1354,6 +1415,7 @@ struct ca0132_spec {
 	unsigned int ae9_acm_setup_tries;
 	bool ae9_hp_jack_rebase; /* first fresh sample preserves manual output */
 	int ae9_acm_tick;
+	int ae9_acm_sbx_pending; /* worker-owned press deferred by mixer contention */
 	/* Display phases/deadlines are protected by ae9_acm_work_lock. */
 	int ae9_acm_display_phase;
 	unsigned long ae9_acm_display_until;
@@ -1447,6 +1509,9 @@ enum {
 
 static void ae9_acm_display_changed(struct ca0132_spec *spec);
 static void ae9_acm_stop(struct ca0132_spec *spec, bool removing);
+static void ae9_mode_stop(struct ca0132_spec *spec, bool removing);
+static int ae9_direct_put(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol);
 static int ae9_control_param(struct hda_codec *codec, unsigned int id,
 			     unsigned int value);
 static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source);
@@ -1455,6 +1520,12 @@ static void ae9_voice_invalidate_input_locked(struct ae9_voice_state *voice);
 static int ae9_direct_prepare_locked(struct hda_codec *codec,
 				     unsigned int rate, unsigned int tag, unsigned int format);
 static int ae9_direct_restore_locked(struct hda_codec *codec);
+static int ae9_direct_hold_dsp(struct hda_codec *codec);
+static int ae9_direct_release_dsp(struct hda_codec *codec);
+static int ae9_direct_reset_dsp(struct hda_codec *codec);
+static bool ae9_direct_format(unsigned int rate, unsigned int format);
+static int ae9_direct_bind(struct hda_codec *codec, unsigned int tag,
+			   unsigned int format);
 static int ae9_direct_mute(struct hda_codec *codec, bool mute);
 static int ae9_direct_output_locked(struct hda_codec *codec);
 static int __ca0132_alt_select_out(struct hda_codec *codec);
@@ -4820,7 +4891,7 @@ static int ae9_direct_set_locked(struct ca0132_spec *spec, bool enabled)
 {
 	if (enabled == spec->ae9_direct.enabled)
 		return 0;
-	if (spec->ae9_direct.opened)
+	if (enabled && (spec->ae9_direct.opened & AE9_PCM_WUH))
 		return -EBUSY;
 	spec->ae9_direct.enabled = enabled;
 	spec->ae9_direct.valid = false;
@@ -4846,8 +4917,12 @@ static int ae9_playback_open(struct hda_pcm_stream *hinfo,
 		spec->ae9_direct.maxbps = hinfo->maxbps;
 		spec->ae9_direct.caps_saved = true;
 	}
-	if (!spec->ae9_direct.enabled)
+	if (!spec->ae9_direct.enabled) {
+		/* Keep the same HDA transport when returning from Direct. */
+		runtime->hw.rates |= SNDRV_PCM_RATE_192000;
+		runtime->hw.rate_max = max(runtime->hw.rate_max, 192000U);
 		return 0;
+	}
 	/* The HDA controller computes its format after this callback. */
 	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000 |
 			    SNDRV_PCM_RATE_192000;
@@ -4874,6 +4949,8 @@ static int ae9_playback_close(struct hda_pcm_stream *hinfo,
 	guard(mutex)(&spec->ae9_output_mutex);
 	if (spec->ae9_direct.caps_saved)
 		hinfo->maxbps = spec->ae9_direct.maxbps;
+	spec->ae9_direct.stream_tag = 0;
+	spec->ae9_direct.prepared = false;
 	ae9_direct_close_locked(spec, AE9_PCM_PLAYBACK);
 	return 0;
 }
@@ -4910,6 +4987,7 @@ static void ae9_output_invalidate(struct hda_codec *codec)
 	spec->ae9_acm_pending_mode = false;
 }
 
+/* Cache only a successfully prepared Linux transport, under output_mutex. */
 static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			struct hda_codec *codec,
 			unsigned int stream_tag,
@@ -4919,15 +4997,22 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 	struct ca0132_spec *spec = codec->spec;
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		scoped_guard(mutex, &spec->ae9_output_mutex) {
-			int err;
+		struct ae9_direct_state *direct = &spec->ae9_direct;
+		int err;
 
-			if (spec->dsp_state != DSP_DOWNLOADED)
-				return -EIO;
-			if (spec->ae9_direct.enabled)
-				return ae9_direct_prepare_locked(codec,
-					substream->runtime->rate, stream_tag, format);
-			if (spec->ae9_direct.touched) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		direct->stream_tag = 0;
+		direct->prepared = false;
+		if (spec->dsp_state != DSP_DOWNLOADED || direct->dsp_ref_unknown)
+			return -EIO;
+		if (direct->enabled) {
+			err = ae9_direct_prepare_locked(codec,
+							substream->runtime->rate,
+							stream_tag, format);
+			if (err < 0)
+				return err;
+		} else {
+			if (direct->touched) {
 				err = ae9_direct_restore_locked(codec);
 				if (err < 0)
 					return err;
@@ -4939,12 +5024,16 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 				return -EIO;
 			snd_hda_codec_setup_stream(codec, spec->dacs[0],
 						   stream_tag, 0, format);
+			direct->valid = true;
+			direct->prepared = true;
 		}
+		direct->stream_tag = stream_tag;
+		direct->stream_format = format;
+		direct->stream_rate = substream->runtime->rate;
 		return 0;
 	}
 
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
-
 	return 0;
 }
 
@@ -4954,27 +5043,32 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	if (spec->dsp_state == DSP_DOWNLOADING)
-		return 0;
-	/* The mode cannot change while this PCM is open. */
-	if (ca0132_quirk(spec) == QUIRK_AE9 &&
-	    READ_ONCE(spec->ae9_direct.enabled)) {
-		guard(mutex)(&spec->ae9_output_mutex);
-		int err = ae9_direct_mute(codec, true);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		int err = 0;
 
-		__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+		guard(mutex)(&spec->ae9_output_mutex);
+		spec->ae9_direct.stream_tag = 0;
 		spec->ae9_direct.prepared = false;
 		spec->ae9_direct.valid = false;
+		if (spec->dsp_state == DSP_DOWNLOADING)
+			return 0;
+		if (spec->ae9_direct.enabled) {
+			err = ae9_direct_mute(codec, true);
+			__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+		} else {
+			if (ca0132_effect_switch_state(spec, PLAY_ENHANCEMENT))
+				msleep(50);
+			snd_hda_codec_cleanup_stream(codec, spec->dacs[0]);
+		}
 		return err;
 	}
 
-	/*If Playback effects are on, allow stream some time to flush
-	 *effects tail*/
+	if (spec->dsp_state == DSP_DOWNLOADING)
+		return 0;
+	/* Allow playback effects to flush their tail. */
 	if (ca0132_effect_switch_state(spec, PLAY_ENHANCEMENT))
 		msleep(50);
-
 	snd_hda_codec_cleanup_stream(codec, spec->dacs[0]);
-
 	return 0;
 }
 
@@ -10014,20 +10108,26 @@ static bool ae9_direct_effect_control(struct snd_kcontrol *kctl)
 		nid == BASS_REDIRECTION;
 }
 
-/* Called only from a put callback, with ALSA's controls_rwsem held. */
+/* Caller holds ALSA's controls_rwsem for write. */
 static void ae9_direct_controls(struct hda_codec *codec, bool active)
 {
-	struct snd_kcontrol *kctl;
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_ctl_proxy *proxy;
+	unsigned int i;
 
-	list_for_each_entry(kctl, &codec->card->controls, list) {
-		if (snd_kcontrol_chip(kctl) != codec ||
-		    !ae9_direct_effect_control(kctl))
+	list_for_each_entry(proxy, &spec->ae9_mode_controls, list) {
+		if (!proxy->effect)
 			continue;
-		if (active)
-			kctl->vd[0].access &= ~SNDRV_CTL_ELEM_ACCESS_INACTIVE;
-		else
-			kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_INACTIVE;
-		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
+		for (i = 0; i < proxy->kctl->count; i++) {
+			if (active)
+				proxy->kctl->vd[i].access &=
+					~SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+			else
+				proxy->kctl->vd[i].access |=
+					SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+			snd_ctl_notify_one(codec->card, SNDRV_CTL_EVENT_MASK_INFO,
+					   proxy->kctl, i);
+		}
 	}
 }
 
@@ -10042,51 +10142,815 @@ static int ae9_direct_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static int ae9_direct_put(struct snd_kcontrol *kcontrol,
-			  struct snd_ctl_elem_value *ucontrol)
+/* Caller holds prepare_mutex, then output_mutex; never controls_rwsem. */
+static int ae9_direct_switch_locked(struct hda_codec *codec, bool enabled,
+				    bool sbx)
 {
-	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
-	long value = ucontrol->value.integer.value[0];
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	bool old = direct->enabled;
+	long old_fx = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
 	int err;
 
-	if (value != 0 && value != 1)
+	lockdep_assert_held(&codec->bus->prepare_mutex);
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (direct->dsp_ref_unknown)
+		return -EIO;
+	if (enabled == old)
+		return direct->stream_tag && !direct->valid ? -EIO : 0;
+	if (spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
+	if (enabled && (direct->opened & AE9_PCM_WUH))
+		return -EBUSY;
+	if (direct->stream_tag &&
+	    !ae9_direct_format(direct->stream_rate, direct->stream_format))
 		return -EINVAL;
-	CLASS(snd_hda_power_pm, pm)(codec);
-	err = ae9_pm_error(codec, pm.err);
+
+	/* The input bind may own the last DSP reference. Pin it before unbind. */
+	if (enabled && direct->stream_tag) {
+		scoped_guard(mutex, &spec->ae9_voice.mutex)
+			err = ae9_direct_hold_dsp(codec);
+		if (err < 0)
+			return err;
+	}
+
+	/* No DMA restart or runtime format change: rebind the Linux tag. */
+	err = ae9_direct_set_locked(spec, enabled);
 	if (err < 0)
 		return err;
-	guard(mutex)(&spec->ae9_output_mutex);
-	if (value == spec->ae9_direct.enabled)
-		return 0;
-	if (spec->ae9_direct.opened) {
-		codec_info(codec, "AE-9: Direct change busy, open mask=0x%x\n",
-			   spec->ae9_direct.opened);
-		return -EBUSY;
+	direct->switching = true;
+	if (enabled) {
+		if (direct->stream_tag) {
+			err = ae9_direct_prepare_locked(codec, direct->stream_rate,
+							direct->stream_tag,
+							direct->stream_format);
+			if (err < 0)
+				goto fail;
+		}
+	} else {
+		if (direct->touched) {
+			err = ae9_direct_restore_locked(codec);
+			if (err < 0)
+				goto fail;
+		} else {
+			err = ae9_direct_mute(codec, true);
+			if (err < 0)
+				goto fail;
+		}
+		if (sbx)
+			spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = 1;
+		err = __ca0132_alt_select_out(codec);
+		if (err < 0)
+			goto fail;
+		err = __ca0132_pe_switch_set(codec);
+		if (err < 0)
+			goto fail;
+		if (direct->stream_tag) {
+			err = ae9_direct_bind(codec, direct->stream_tag,
+					      direct->stream_format);
+			if (err < 0)
+				goto fail;
+		}
 	}
-	if (!value && spec->ae9_direct.touched) {
-		err = ae9_direct_restore_locked(codec);
+	if (direct->stream_tag || !enabled) {
+		err = ae9_direct_mute(codec, direct->saved_mute);
 		if (err < 0)
 			goto fail;
 	}
-	err = ae9_direct_set_locked(spec, value);
-	if (err <= 0)
-		return err;
-	if (!value) {
-		err = __ca0132_alt_select_out(codec);
-		if (err < 0) {
-			spec->ae9_direct.enabled = true;
-			goto fail;
-		}
-	}
-	ae9_direct_controls(codec, !value);
+	direct->switching = false;
+	direct->valid = direct->stream_tag != 0;
+	direct->prepared = direct->stream_tag != 0;
 	WRITE_ONCE(spec->ae9_acm_pending_fx, true);
 	return 1;
 fail:
-	spec->ae9_direct.valid = false;
+	/* Keep the requested mode and settings; a partial route stays silent. */
+	ae9_direct_mute(codec, true);
+	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+	direct->enabled = old;
+	spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = old_fx;
+	/* Preserve the pre-transition mute until a complete route succeeds. */
+	direct->touched = true;
+	direct->switching = false;
+	direct->valid = false;
+	direct->prepared = false;
 	spec->ae9_output_applied = false;
 	spec->ae9_acm_pending_mode = false;
+	codec_err(codec, "AE-9: live mode change failed: %d\n", err);
 	return err;
+}
+
+/* References cover callbacks which can also originate from the ACM worker. */
+static struct ae9_ctl_proxy *ae9_ctl_proxy_get(struct snd_kcontrol *kctl)
+{
+	struct ae9_ctl_proxy *proxy;
+	unsigned long flags;
+
+	xa_lock_irqsave(&ae9_ctl_registry, flags);
+	proxy = xa_load(&ae9_ctl_registry, (unsigned long)kctl);
+	if (proxy)
+		refcount_inc(&proxy->refs);
+	xa_unlock_irqrestore(&ae9_ctl_registry, flags);
+	return proxy;
+}
+
+static void ae9_ctl_proxy_put(struct ae9_ctl_proxy *proxy)
+{
+	if (refcount_dec_and_test(&proxy->refs))
+		complete(&proxy->released);
+}
+
+static int ae9_ctl_index(struct snd_kcontrol *kctl,
+			 struct snd_ctl_elem_id *id)
+{
+	unsigned int index;
+
+	/* Internal mono actions historically pass an empty ID. */
+	if (!id->numid && !id->index && kctl->count == 1)
+		return 0;
+	if (id->numid) {
+		if (id->numid < kctl->id.numid)
+			return -EINVAL;
+		index = id->numid - kctl->id.numid;
+	} else {
+		if (id->index < kctl->id.index)
+			return -EINVAL;
+		index = id->index - kctl->id.index;
+	}
+	if (index >= kctl->count)
+		return -EINVAL;
+	return array_index_nospec(index, kctl->count);
+}
+
+static void ae9_ctl_value_id(struct snd_kcontrol *kctl, unsigned int index,
+			     struct snd_ctl_elem_value *value)
+{
+	memset(value, 0, sizeof(*value));
+	value->id = kctl->id;
+	value->id.numid += index;
+	value->id.index += index;
+}
+
+/* ALSA validates .info before .put, including with input validation enabled. */
+static int ae9_ctl_info(struct snd_kcontrol *kctl,
+			 struct snd_ctl_elem_info *info)
+{
+	struct ae9_ctl_proxy *proxy = ae9_ctl_proxy_get(kctl);
+	struct ca0132_spec *spec;
+	struct ae9_ctl_value *value;
+	unsigned long flags;
+	unsigned int item;
+	int index, err;
+
+	if (!proxy)
+		return -ENODEV;
+	spec = proxy->spec;
+	index = ae9_ctl_index(kctl, &info->id);
+	if (index < 0) {
+		err = index;
+		goto out;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (spec->ae9_mode_pending || !spec->ae9_mode_active ||
+	    !spec->ae9_mode_ready) {
+		value = &proxy->values[index];
+		item = info->value.enumerated.item;
+		if (item >= value->info_count)
+			item = value->info_count - 1;
+		info->type = value->info[item].type;
+		info->count = value->info[item].count;
+		info->value = value->info[item].value;
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		err = 0;
+		goto out;
+	}
+	spec->ae9_mode_users++;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	err = proxy->info(kctl, info);
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	spec->ae9_mode_users--;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+out:
+	ae9_ctl_proxy_put(proxy);
+	return err;
+}
+
+/* Keep CONFIG_SND_CTL_DEBUG's sentinel beyond the declared payload intact. */
+static int ae9_ctl_copy_value(struct snd_ctl_elem_value *dst,
+			      const struct snd_ctl_elem_value *src,
+			      const struct snd_ctl_elem_info *info)
+{
+	size_t size;
+
+	switch (info->type) {
+	case SNDRV_CTL_ELEM_TYPE_BOOLEAN:
+	case SNDRV_CTL_ELEM_TYPE_INTEGER:
+		if (info->count > ARRAY_SIZE(dst->value.integer.value))
+			return -EINVAL;
+		size = info->count * sizeof(dst->value.integer.value[0]);
+		break;
+	case SNDRV_CTL_ELEM_TYPE_INTEGER64:
+		if (info->count > ARRAY_SIZE(dst->value.integer64.value))
+			return -EINVAL;
+		size = info->count * sizeof(dst->value.integer64.value[0]);
+		break;
+	case SNDRV_CTL_ELEM_TYPE_ENUMERATED:
+		if (info->count > ARRAY_SIZE(dst->value.enumerated.item))
+			return -EINVAL;
+		size = info->count * sizeof(dst->value.enumerated.item[0]);
+		break;
+	case SNDRV_CTL_ELEM_TYPE_BYTES:
+		if (info->count > ARRAY_SIZE(dst->value.bytes.data))
+			return -EINVAL;
+		size = info->count;
+		break;
+	case SNDRV_CTL_ELEM_TYPE_IEC958:
+		size = sizeof(dst->value.iec958);
+		break;
+	default:
+		return -EINVAL;
+	}
+	memcpy(&dst->value, &src->value, size);
+	return 0;
+}
+
+static int ae9_ctl_get(struct snd_kcontrol *kctl,
+			struct snd_ctl_elem_value *value)
+{
+	struct ae9_ctl_proxy *proxy = ae9_ctl_proxy_get(kctl);
+	struct ca0132_spec *spec;
+	unsigned long flags;
+	int index, err;
+
+	if (!proxy)
+		return -ENODEV;
+	spec = proxy->spec;
+	index = ae9_ctl_index(kctl, &value->id);
+	if (index < 0) {
+		err = index;
+		goto out;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (spec->ae9_mode_pending || !spec->ae9_mode_active ||
+	    !spec->ae9_mode_ready) {
+		err = proxy->values[index].error;
+		if (err >= 0)
+			err = ae9_ctl_copy_value(value, &proxy->values[index].value,
+						 &proxy->values[index].info[0]);
+		if (spec->ae9_mode_pending) {
+			if (proxy->get == ae9_direct_get &&
+			    spec->ae9_mode_action != AE9_MODE_OUTFX) {
+				value->value.integer.value[0] = spec->ae9_mode_requested;
+				err = 0;
+			} else if (proxy->outfx &&
+				   spec->ae9_mode_action != AE9_MODE_DIRECT) {
+				value->value.integer.value[0] = spec->ae9_mode_fx_value;
+				err = 0;
+			}
+		}
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		goto out;
+	}
+	spec->ae9_mode_users++;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	err = proxy->get(kctl, value);
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	proxy->values[index].error = err;
+	if (err >= 0)
+		proxy->values[index].value.value = value->value;
+	spec->ae9_mode_users--;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+out:
+	ae9_ctl_proxy_put(proxy);
+	return err;
+}
+
+static int ae9_mode_request(struct ca0132_spec *spec,
+			    enum ae9_mode_action action, bool value);
+
+static int ae9_ctl_put(struct snd_kcontrol *kctl,
+			struct snd_ctl_elem_value *value)
+{
+	struct ae9_ctl_proxy *proxy = ae9_ctl_proxy_get(kctl);
+	struct snd_ctl_elem_value *readback;
+	struct ca0132_spec *spec;
+	unsigned long flags;
+	int index, err, get_err;
+
+	if (!proxy)
+		return -ENODEV;
+	spec = proxy->spec;
+	index = ae9_ctl_index(kctl, &value->id);
+	if (index < 0) {
+		err = index;
+		goto out;
+	}
+	if (proxy->outfx) {
+		long requested = value->value.integer.value[0];
+
+		err = requested != 0 && requested != 1 ? -EINVAL :
+			ae9_mode_request(spec, AE9_MODE_OUTFX, requested);
+		goto out;
+	}
+	/* Direct admission sets its own gate without entering a slow callback. */
+	if (proxy->put == ae9_direct_put) {
+		err = proxy->put(kctl, value);
+		goto out;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (spec->ae9_mode_pending || !spec->ae9_mode_active ||
+	    !spec->ae9_mode_ready) {
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		err = -EBUSY;
+		goto out;
+	}
+	spec->ae9_mode_users++;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	/* Admission is outside vmaster, before it mutates any logical value. */
+	err = proxy->put(kctl, value);
+	readback = kzalloc_obj(*readback);
+	get_err = -ENOMEM;
+	if (readback) {
+		ae9_ctl_value_id(kctl, index, readback);
+		get_err = proxy->get ? proxy->get(kctl, readback) : -EACCES;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	proxy->values[index].error = get_err;
+	if (get_err >= 0)
+		proxy->values[index].value.value = readback->value;
+	spec->ae9_mode_users--;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	kfree(readback);
+out:
+	ae9_ctl_proxy_put(proxy);
+	return err;
+}
+
+static int ae9_mode_idle_apply(struct ca0132_spec *spec,
+			       enum ae9_mode_action action, bool value,
+			       bool *handled);
+
+static int ae9_mode_request(struct ca0132_spec *spec,
+			    enum ae9_mode_action action, bool value)
+{
+	unsigned long flags;
+	int err = 1;
+	bool locked = false, handled;
+
+	/* Inspect a Direct no-op without waiting behind PCM or the route worker. */
+	if (action == AE9_MODE_DIRECT)
+		locked = mutex_trylock(&spec->ae9_output_mutex);
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_ready || !spec->ae9_mode_active ||
+	    spec->ae9_mode_removing || spec->ae9_mode_pending || spec->ae9_mode_users)
+		err = -EBUSY;
+	else if (locked && spec->ae9_direct.dsp_ref_unknown)
+		err = -EIO;
+	else if (locked && value == spec->ae9_direct.enabled)
+		err = spec->ae9_direct.stream_tag && !spec->ae9_direct.valid ?
+			-EIO : 0;
+	else if (action == AE9_MODE_OUTFX &&
+		 READ_ONCE(spec->ae9_direct.enabled))
+		err = -EBUSY;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	if (locked)
+		mutex_unlock(&spec->ae9_output_mutex);
+	if (err != 1)
+		return err;
+	if (action != AE9_MODE_SBX_BUTTON) {
+		err = ae9_mode_idle_apply(spec, action, value, &handled);
+		if (handled)
+			return err;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_ready || !spec->ae9_mode_active ||
+	    spec->ae9_mode_removing || spec->ae9_mode_pending || spec->ae9_mode_users) {
+		err = -EBUSY;
+	} else {
+		spec->ae9_mode_requested = value;
+		spec->ae9_mode_action = action;
+		spec->ae9_mode_fx_value = action == AE9_MODE_OUTFX ? value :
+			(READ_ONCE(spec->ae9_direct.enabled) ||
+			 !READ_ONCE(spec->effects_switch[PLAY_ENHANCEMENT -
+						EFFECT_START_NID]));
+		spec->ae9_mode_pending = true;
+		spec->ae9_mode_done = false;
+		mod_delayed_work(system_wq, &spec->ae9_mode_work, 0);
+		err = 1;
+	}
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	return err;
+}
+
+static int ae9_direct_put(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct ae9_ctl_proxy *proxy = ae9_ctl_proxy_get(kcontrol);
+	long value = ucontrol->value.integer.value[0];
+	int err;
+
+	if (!proxy)
+		return -ENODEV;
+	if (value != 0 && value != 1)
+		err = -EINVAL;
+	else
+		err = ae9_mode_request(proxy->spec, AE9_MODE_DIRECT, value);
+	ae9_ctl_proxy_put(proxy);
+	return err;
+}
+
+static int ae9_mode_error_info(struct snd_kcontrol *kctl,
+			       struct snd_ctl_elem_info *info)
+{
+	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	info->count = 1;
+	info->value.integer.min = -MAX_ERRNO;
+	info->value.integer.max = 0;
+	return 0;
+}
+
+static int ae9_mode_error_get(struct snd_kcontrol *kctl,
+			      struct snd_ctl_elem_value *value)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kctl);
+	struct ca0132_spec *spec = codec->spec;
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	value->value.integer.value[0] = spec->ae9_mode_error;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	return 0;
+}
+
+/* No controls_rwsem: the closed admission gate excludes ordinary callbacks. */
+static void ae9_mode_snapshot(struct ca0132_spec *spec, bool powered)
+{
+	struct ae9_ctl_proxy *proxy;
+	unsigned int i;
+
+	list_for_each_entry(proxy, &spec->ae9_mode_controls, list) {
+		for (i = 0; i < proxy->kctl->count; i++) {
+			if (!READ_ONCE(spec->ae9_mode_active))
+				return;
+			if (!powered) {
+				proxy->values[i].next = proxy->values[i].value;
+				proxy->values[i].next_error = proxy->values[i].error;
+				continue;
+			}
+			ae9_ctl_value_id(proxy->kctl, i, &proxy->values[i].next);
+			proxy->values[i].next_error = proxy->get ?
+				proxy->get(proxy->kctl, &proxy->values[i].next) : -EACCES;
+		}
+	}
+}
+
+/* Caller holds mode_lock; these are value copies only, never callbacks. */
+static void ae9_mode_cache_publish(struct ca0132_spec *spec)
+{
+	struct ae9_ctl_proxy *proxy;
+	unsigned int i;
+
+	list_for_each_entry(proxy, &spec->ae9_mode_controls, list) {
+		for (i = 0; i < proxy->count; i++) {
+			proxy->values[i].value.value = proxy->values[i].next.value;
+			proxy->values[i].error = proxy->values[i].next_error;
+		}
+	}
+}
+
+static void ae9_mode_notify(struct hda_codec *codec, const char *name)
+{
+	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, name);
+
+	if (kctl)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+}
+
+static int ae9_mode_apply_locked(struct hda_codec *codec,
+				 enum ae9_mode_action action, bool value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	long old;
+	int err;
+
+	lockdep_assert_held(&codec->bus->prepare_mutex);
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
+	if (action == AE9_MODE_OUTFX && spec->ae9_direct.enabled)
+		return -EBUSY;
+	if (action == AE9_MODE_DIRECT || spec->ae9_direct.enabled)
+		return ae9_direct_switch_locked(codec, value,
+						action == AE9_MODE_SBX_BUTTON);
+	old = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
+	spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] =
+		action == AE9_MODE_OUTFX ? value : !old;
+	err = __ca0132_pe_switch_set(codec);
+	if (err < 0)
+		spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = old;
+	else
+		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
+	return err;
+}
+
+/* ALSA holds controls_rwsem for write. Preserve idle alsactl restoration. */
+static int ae9_mode_idle_apply(struct ca0132_spec *spec,
+			       enum ae9_mode_action action, bool value,
+			       bool *handled)
+{
+	struct hda_codec *codec = spec->codec;
+	unsigned long flags;
+	bool published = false;
+	int err = 0;
+
+	*handled = false;
+	if (READ_ONCE(spec->ae9_direct.opened) ||
+	    READ_ONCE(spec->ae9_direct.stream_tag) ||
+	    READ_ONCE(spec->ae9_direct.prepared))
+		return 0;
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_ready || !spec->ae9_mode_active ||
+	    spec->ae9_mode_pending || spec->ae9_mode_users) {
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		*handled = true;
+		return -EBUSY;
+	}
+	/* Exclude the asynchronous producer until synchronous restoration ends. */
+	spec->ae9_mode_users++;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	CLASS(snd_hda_power_pm, pm)(codec);
+	err = ae9_pm_error(codec, pm.err);
+	if (err < 0) {
+		*handled = true;
+		goto out;
+	}
+	if (!mutex_trylock(&codec->bus->prepare_mutex))
+		goto out;
+	if (!mutex_trylock(&spec->ae9_output_mutex)) {
+		mutex_unlock(&codec->bus->prepare_mutex);
+		goto out;
+	}
+	/* A PCM may have appeared since the initial hint, before either trylock. */
+	if (!spec->ae9_direct.opened && !spec->ae9_direct.stream_tag &&
+	    !spec->ae9_direct.prepared && READ_ONCE(spec->ae9_mode_active)) {
+		*handled = true;
+		err = ae9_mode_apply_locked(codec, action, value);
+	}
+	mutex_unlock(&spec->ae9_output_mutex);
+	mutex_unlock(&codec->bus->prepare_mutex);
+	if (!*handled)
+		goto out;
+	ae9_mode_snapshot(spec, true);
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_active) {
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		err = -ECANCELED;
+		goto out;
+	}
+	ae9_mode_cache_publish(spec);
+	spec->ae9_mode_error = min(err, 0);
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	ae9_direct_controls(codec, !READ_ONCE(spec->ae9_direct.enabled));
+	ae9_mode_notify(codec, "AE-9: Direct Mode Switch");
+	ae9_mode_notify(codec, "Enable OutFX Playback Switch");
+	ae9_mode_notify(codec, "AE-9: Last Mode Error");
+	published = true;
+out:
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	spec->ae9_mode_users--;
+	if (*handled && err < 0)
+		spec->ae9_mode_error = err;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	if (*handled && err < 0 && !published)
+		ae9_mode_notify(codec, "AE-9: Last Mode Error");
+	return err;
+}
+
+static void ae9_mode_work_fn(struct work_struct *work)
+{
+	struct ca0132_spec *spec = container_of(to_delayed_work(work),
+						struct ca0132_spec, ae9_mode_work);
+	struct hda_codec *codec = spec->codec;
+	unsigned long flags;
+	bool done, enabled, powered;
+	enum ae9_mode_action action;
+	int err;
+
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_active || !spec->ae9_mode_pending) {
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		return;
+	}
+	done = spec->ae9_mode_done;
+	enabled = spec->ae9_mode_requested;
+	action = spec->ae9_mode_action;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	if (!done) {
+		CLASS(snd_hda_power_pm, pm)(codec);
+
+		err = ae9_pm_error(codec, pm.err);
+		powered = err >= 0;
+		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+		if (!spec->ae9_mode_active || !spec->ae9_mode_pending) {
+			if (err < 0)
+				spec->ae9_mode_error = err;
+			spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+			return;
+		}
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		if (err >= 0) {
+			/* Capture changes made by init or coupled controls since build. */
+			ae9_mode_snapshot(spec, true);
+			spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+			if (!spec->ae9_mode_active || !spec->ae9_mode_pending) {
+				spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+				return;
+			}
+			ae9_mode_cache_publish(spec);
+			spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+			scoped_guard(mutex, &codec->bus->prepare_mutex) {
+				guard(mutex)(&spec->ae9_output_mutex);
+				err = ae9_mode_apply_locked(codec, action, enabled);
+			}
+		}
+		/* Refresh only after releasing prepare/output/voice/DAC locks. */
+		ae9_mode_snapshot(spec, powered);
+		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+		spec->ae9_mode_result = err;
+		spec->ae9_mode_done = true;
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	}
+	/* Disconnect may cancel this worker while holding this write lock. */
+	if (!down_write_trylock(&codec->card->controls_rwsem)) {
+		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+		if (spec->ae9_mode_active && spec->ae9_mode_pending)
+			mod_delayed_work(system_wq, &spec->ae9_mode_work,
+					 msecs_to_jiffies(10));
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		return;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_active || !spec->ae9_mode_pending) {
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		up_write(&codec->card->controls_rwsem);
+		return;
+	}
+	ae9_mode_cache_publish(spec);
+	spec->ae9_mode_error = min(spec->ae9_mode_result, 0);
+	spec->ae9_mode_pending = false;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	ae9_direct_controls(codec, !READ_ONCE(spec->ae9_direct.enabled));
+	ae9_mode_notify(codec, "AE-9: Direct Mode Switch");
+	ae9_mode_notify(codec, "Enable OutFX Playback Switch");
+	ae9_mode_notify(codec, "AE-9: Last Mode Error");
+	up_write(&codec->card->controls_rwsem);
+}
+
+static void ae9_mode_start(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_removing)
+		spec->ae9_mode_active = true;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+}
+
+static void ae9_mode_stop(struct ca0132_spec *spec, bool removing)
+{
+	unsigned long flags;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	spec->ae9_mode_active = false;
+	if (removing) {
+		spec->ae9_mode_removing = true;
+		spec->ae9_mode_ready = false;
+	}
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	/* A failed PM resume can stop producers from inside this very worker. */
+	if (current_work() != &spec->ae9_mode_work.work)
+		cancel_delayed_work_sync(&spec->ae9_mode_work);
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (spec->ae9_mode_pending)
+		spec->ae9_mode_error = -ECANCELED;
+	spec->ae9_mode_pending = false;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+}
+
+static void ae9_ctl_proxy_free(struct ae9_ctl_proxy *proxy)
+{
+	unsigned int i;
+
+	for (i = 0; i < proxy->count; i++)
+		kfree(proxy->values[i].info);
+	kfree(proxy);
+}
+
+static void ae9_mode_controls_free(struct ca0132_spec *spec)
+{
+	struct ae9_ctl_proxy *proxy, *next;
+
+	list_for_each_entry_safe(proxy, next, &spec->ae9_mode_controls, list) {
+		/* ALSA may already have freed/restored kctl. Do not dereference it. */
+		xa_erase(&ae9_ctl_registry, (unsigned long)proxy->kctl);
+		ae9_ctl_proxy_put(proxy);
+		wait_for_completion(&proxy->released);
+		list_del(&proxy->list);
+		ae9_ctl_proxy_free(proxy);
+	}
+}
+
+static int ae9_ctl_info_build(struct ae9_ctl_proxy *proxy, unsigned int index)
+{
+	struct snd_ctl_elem_info *info __free(kfree) = kzalloc_obj(*info);
+	struct ae9_ctl_value *value = &proxy->values[index];
+	unsigned int i, count = 1;
+	int err;
+
+	if (!info)
+		return -ENOMEM;
+	info->id = proxy->kctl->id;
+	info->id.numid += index;
+	info->id.index += index;
+	err = proxy->info(proxy->kctl, info);
+	if (err < 0)
+		return err;
+	if (info->type == SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+		count = info->value.enumerated.items;
+	if (!count)
+		return -EINVAL;
+	value->info = kcalloc(count, sizeof(*info), GFP_KERNEL);
+	if (!value->info)
+		return -ENOMEM;
+	value->info_count = count;
+	value->info[0] = *info;
+	for (i = 1; i < count; i++) {
+		info->value.enumerated.item = i;
+		err = proxy->info(proxy->kctl, info);
+		if (err < 0)
+			return err;
+		value->info[i] = *info;
+	}
+	return 0;
+}
+
+static int ae9_mode_controls_build(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct hda_nid_item *items = codec->mixers.list;
+	struct ae9_ctl_proxy *proxy;
+	struct snd_kcontrol *kctl;
+	unsigned int i, n;
+	unsigned long flags;
+	int err;
+
+	/* Called once, after vmaster and all codec controls have been installed. */
+	for (n = 0; n < codec->mixers.used; n++) {
+		kctl = items[n].kctl;
+		if ((!kctl->get && !kctl->put) || kctl->get == ae9_mode_error_get)
+			continue;
+		proxy = kzalloc(struct_size(proxy, values, kctl->count), GFP_KERNEL);
+		if (!proxy)
+			return -ENOMEM;
+		proxy->spec = spec;
+		proxy->kctl = kctl;
+		proxy->info = kctl->info;
+		proxy->count = kctl->count;
+		proxy->get = kctl->get;
+		proxy->put = kctl->put;
+		proxy->effect = ae9_direct_effect_control(kctl);
+		proxy->outfx = kctl->put == ca0132_switch_put &&
+			get_amp_nid(kctl) == PLAY_ENHANCEMENT;
+		refcount_set(&proxy->refs, 1);
+		init_completion(&proxy->released);
+		for (i = 0; i < kctl->count; i++) {
+			err = ae9_ctl_info_build(proxy, i);
+			if (err < 0) {
+				ae9_ctl_proxy_free(proxy);
+				return err;
+			}
+			ae9_ctl_value_id(kctl, i, &proxy->values[i].value);
+			proxy->values[i].error = proxy->get ?
+				proxy->get(kctl, &proxy->values[i].value) : -EACCES;
+		}
+		err = xa_insert(&ae9_ctl_registry, (unsigned long)kctl, proxy,
+				GFP_KERNEL);
+		if (err < 0) {
+			ae9_ctl_proxy_free(proxy);
+			return err;
+		}
+		list_add_tail(&proxy->list, &spec->ae9_mode_controls);
+		kctl->info = ae9_ctl_info;
+		if (kctl->get)
+			kctl->get = ae9_ctl_get;
+		if (kctl->put)
+			kctl->put = ae9_ctl_put;
+	}
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	spec->ae9_mode_ready = true;
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	return 0;
 }
 
 static const struct snd_kcontrol_new ae9_direct_controls_new[] = {
@@ -10096,6 +10960,13 @@ static const struct snd_kcontrol_new ae9_direct_controls_new[] = {
 		.info = snd_ctl_boolean_mono_info,
 		.get = ae9_direct_get,
 		.put = ae9_direct_put,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "AE-9: Last Mode Error",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ,
+		.info = ae9_mode_error_info,
+		.get = ae9_mode_error_get,
 	},
 	{ }
 };
@@ -10313,6 +11184,8 @@ static int ca0132_build_controls(struct hda_codec *codec)
 	if (ca0132_use_alt_functions(spec))
 		ca0132_alt_add_chmap_ctls(codec);
 
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		return ae9_mode_controls_build(codec);
 	return 0;
 }
 
@@ -11710,6 +12583,133 @@ static int ae9_direct_drain(struct hda_codec *codec, u8 id)
 	return -EIO;
 }
 
+/* Keep stream selection and its reference command indivisible. */
+static int ae9_direct_ref_control(struct hda_codec *codec, bool on,
+				  bool *submitted)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	*submitted = false;
+	scoped_guard(mutex, &spec->chipio_mutex) {
+		err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+		if (err < 0)
+			return err;
+		err = ae9_voice_param_locked(codec, CONTROL_PARAM_STREAM_ID, 0x0c);
+		if (err < 0)
+			return err;
+		err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+		if (err < 0)
+			return err;
+		*submitted = true;
+		err = ae9_voice_param_locked(codec, CONTROL_PARAM_STREAM_CONTROL, on);
+		if (err < 0)
+			return err;
+	}
+	msleep(on ? 75 : 50);
+	return ae9_direct_wait(codec);
+}
+
+/* Retain one verified reference across both modes, never one per switch. */
+static int ae9_direct_hold_dsp(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	bool submitted;
+	int before, after, err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	lockdep_assert_held(&spec->ae9_voice.mutex);
+	if (direct->dsp_ref_unknown)
+		return -EIO;
+	before = ae9_direct_xram(codec, 0x0734 + 10 * 0x0c);
+	if (before < 0)
+		return before;
+	if (!before || before > 8) {
+		if (direct->dsp_ref_held)
+			direct->dsp_ref_unknown = true;
+		return -EIO;
+	}
+	if (direct->dsp_ref_held)
+		return 0;
+	if (before == 8)
+		return -EIO;
+
+	err = ae9_direct_ref_control(codec, true, &submitted);
+	if (!submitted)
+		return err;
+	direct->dsp_ref_unknown = true;
+	after = ae9_direct_xram(codec, 0x0734 + 10 * 0x0c);
+	if (after == before + 1) {
+		direct->dsp_ref_held = true;
+		direct->dsp_ref_unknown = false;
+		codec_info(codec, "AE-9: retained DSP reference %d -> %d\n",
+			   before, after);
+	}
+	if (err < 0)
+		return err;
+	return direct->dsp_ref_unknown ? (after < 0 ? after : -EIO) : 0;
+}
+
+/* Shutdown only: do not free the last DSP allocation during live routing. */
+static int ae9_direct_release_dsp(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	bool submitted;
+	int before, after, err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	lockdep_assert_held(&spec->ae9_voice.mutex);
+	if (direct->dsp_ref_unknown)
+		return -EIO;
+	if (!direct->dsp_ref_held)
+		return 0;
+	before = ae9_direct_xram(codec, 0x0734 + 10 * 0x0c);
+	if (before < 0)
+		return before;
+	if (!before || before > 8) {
+		direct->dsp_ref_unknown = true;
+		return -EIO;
+	}
+	err = ae9_direct_ref_control(codec, false, &submitted);
+	if (!submitted)
+		return err;
+	direct->dsp_ref_held = false;
+	direct->dsp_ref_unknown = true;
+	after = ae9_direct_xram(codec, 0x0734 + 10 * 0x0c);
+	if (after == before - 1)
+		direct->dsp_ref_unknown = false;
+	if (err < 0)
+		return err;
+	return direct->dsp_ref_unknown ? (after < 0 ? after : -EIO) : 0;
+}
+
+/* Full initialization only, after users have stopped and before DMA reset. */
+static int ae9_direct_reset_dsp(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	lockdep_assert_held(&spec->ae9_voice.mutex);
+	if (!direct->dsp_ref_held && !direct->dsp_ref_unknown)
+		return 0;
+	/* Settle any ambiguous reference command before accepting a zero. */
+	err = ae9_direct_wait(codec);
+	if (!err)
+		err = ae9_direct_drain(codec, 0x0c);
+	if (err < 0) {
+		direct->dsp_ref_unknown = true;
+		return err;
+	}
+	direct->dsp_ref_held = false;
+	direct->dsp_ref_unknown = false;
+	direct->dsp_pair_valid = false;
+	return 0;
+}
+
 static int ae9_direct_pll(struct hda_codec *codec, u8 reg, u8 value)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -12043,23 +13043,32 @@ static int ae9_direct_program(struct hda_codec *codec,
 }
 
 /* Caller owns output_mutex; serialize clock changes with voice preparation. */
+static bool ae9_direct_format(unsigned int rate, unsigned int format)
+{
+	unsigned int base;
+
+	if (!ae9_direct_rate(rate))
+		return false;
+	base = rate == 48000 ? 0x0001 : rate == 96000 ? 0x0801 : 0x1801;
+	return format == (base | 0x30) || format == (base | 0x40);
+}
+
 static int ae9_direct_prepare_locked(struct hda_codec *codec,
 				     unsigned int rate, unsigned int tag, unsigned int format)
 {
 	struct ca0132_spec *spec = codec->spec;
 	struct ae9_direct_state *direct = &spec->ae9_direct;
 	const struct ae9_direct_rate *params = ae9_direct_rate(rate);
-	unsigned int expected;
 	bool muted;
 	int err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
-	if (!params || !tag || tag > 15)
-		return -EINVAL;
-	expected = rate == 48000 ? 0x0041 : rate == 96000 ? 0x0841 : 0x1841;
-	if (format != expected)
+	if (!params || !tag || tag > 15 || !ae9_direct_format(rate, format))
 		return -EINVAL;
 	guard(mutex)(&spec->ae9_voice.mutex);
+	err = ae9_direct_hold_dsp(codec);
+	if (err < 0)
+		return err;
 	direct->valid = false;
 	direct->prepared = false;
 	if (!direct->touched) {
@@ -12083,9 +13092,11 @@ static int ae9_direct_prepare_locked(struct hda_codec *codec,
 	if (err < 0)
 		goto fail;
 	spec->ae9_direct.stage = "prepare:4:ae9_direct_mute";
-	err = ae9_direct_mute(codec, muted);
-	if (err < 0)
-		goto fail;
+	if (!direct->switching) {
+		err = ae9_direct_mute(codec, muted);
+		if (err < 0)
+			goto fail;
+	}
 	direct->rate = rate;
 	direct->valid = true;
 	direct->prepared = true;
@@ -12229,9 +13240,11 @@ static int ae9_direct_restore_locked(struct hda_codec *codec)
 	if (err < 0)
 		goto fail;
 	spec->ae9_direct.stage = "restore:15:ae9_direct_mute";
-	err = ae9_direct_mute(codec, direct->saved_mute);
-	if (err < 0)
-		goto fail;
+	if (!direct->switching) {
+		err = ae9_direct_mute(codec, direct->saved_mute);
+		if (err < 0)
+			goto fail;
+	}
 	direct->touched = false;
 	direct->rate = 96000;
 	return 0;
@@ -12989,6 +14002,7 @@ static void ae9_acm_start(struct ca0132_spec *spec, unsigned long delay)
 {
 	unsigned long flags;
 
+	ae9_mode_start(spec);
 	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
 	if (!spec->ae9_acm_active && !spec->ae9_acm_removing) {
 		spec->ae9_acm_active = true;
@@ -13007,6 +14021,7 @@ static void ae9_acm_stop(struct ca0132_spec *spec, bool removing)
 {
 	unsigned long flags;
 
+	ae9_mode_stop(spec, removing);
 	/*
 	 * Disable producers under the lock, then drain the worker outside it.
 	 * Temporary stops allow restart; removal permanently closes that gate.
@@ -13619,42 +14634,23 @@ static void ae9_acm_sync_fx(struct ca0132_spec *spec)
 	ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
 }
 
-/* The ACM's SBX button toggles Enable OutFX, like Windows does. */
+/* In Direct, SBX selects the DSP and enables effects in one transaction. */
 static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 {
 	struct ca0132_spec *spec = codec->spec;
-	struct snd_kcontrol *kctl;
-	bool old;
 	int err;
 
-	if (!ms)
+	if (ms > 0 && ms < 5000)
+		spec->ae9_acm_sbx_pending = ms;
+	if (!spec->ae9_acm_sbx_pending)
 		return;
-	if (ms >= 5000) {			/* Long SBX presses are intentionally ignored. */
-		codec_info(codec, "AE-9 ACM: SBX button long press (%d ms), ignored\n", ms);
+	/* The same admission gate covers both ALSA and physical SBX requests. */
+	err = ae9_mode_request(spec, AE9_MODE_SBX_BUTTON, false);
+	if (err == -EBUSY)
 		return;
-	}
-	scoped_guard(mutex, &spec->ae9_output_mutex) {
-		if (spec->ae9_direct.enabled)
-			return;
-		old = ae9_fx_enabled(spec);
-		WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID],
-			   !old);
-		err = __ca0132_pe_switch_set(codec);
-		if (err < 0) {
-			WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT -
-						       EFFECT_START_NID], old);
-			codec_warn(codec,
-				   "AE-9 ACM: SBX update failed: %d; DSP effects may be partial\n",
-				   err);
-			return;
-		}
-		codec_info(codec, "AE-9 ACM: SBX button (%d ms) -> OutFX %s\n", ms,
-			   ae9_fx_enabled(spec) ? "on" : "off");
-		WRITE_ONCE(spec->ae9_acm_pending_fx, true);
-	}
-	kctl = snd_hda_find_mixer_ctl(codec, "Enable OutFX Playback Switch");
-	if (kctl)
-		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+	spec->ae9_acm_sbx_pending = 0;
+	if (err < 0)
+		codec_warn(codec, "AE-9 ACM: SBX request failed: %d\n", err);
 }
 
 static void ae9_acm_service_buttons(struct hda_codec *codec)
@@ -14351,13 +15347,22 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	int idx, i, err;
 	const char *stage = "master-control/overlay";
 
+	if (spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		guard(mutex)(&spec->ae9_voice.mutex);
+		err = ae9_direct_reset_dsp(codec);
+	}
+	if (err < 0)
+		return err;
+
 	spec->ae9_direct.touched = false;
+	spec->ae9_direct.stream_tag = 0;
+	spec->ae9_direct.switching = false;
 	spec->ae9_direct.prepared = false;
 	spec->ae9_direct.valid = false;
 	spec->ae9_direct.dsp_pair_valid = false;
 	spec->ae9_direct.rate = 0;
-	if (spec->dsp_state != DSP_DOWNLOADED)
-		return -EIO;
 
 	/*
 	 * Preserve captured startup order: MASTERCONTROL/overlay, defaults,
@@ -15058,6 +16063,12 @@ static void ae9_exit_chip(struct hda_codec *codec)
 		codec_warn(codec, "AE-9 ACM power-down TX failed: %d\n", err);
 
 	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 0);
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		guard(mutex)(&spec->ae9_voice.mutex);
+		err = ae9_direct_release_dsp(codec);
+	}
+	if (err < 0)
+		codec_warn(codec, "AE-9: DSP reference release failed: %d\n", err);
 	chipio_set_stream_control(codec, 0x0c, 0);
 	msleep(50);
 
@@ -15867,6 +16878,8 @@ static void ca0132_free(struct hda_codec *codec)
 	/* Detach the ALSA lifetime guard before freeing its spec pointer. */
 	if (spec->ae9_acm_mic_managed)
 		snd_device_free(codec->card, spec);
+	/* Drain admitted control callbacks before any hardware/resource teardown. */
+	ae9_mode_controls_free(spec);
 	err = snd_hda_power_up(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0) {
 		codec_warn(codec, "AE-9 remove: power-up failed: %d\n", err);
@@ -16235,6 +17248,8 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	mutex_init(&spec->ae9_voice.mutex);
 	mutex_init(&spec->ae9_scp_mutex);
 	spin_lock_init(&spec->ae9_acm_work_lock);
+	spin_lock_init(&spec->ae9_mode_lock);
+	INIT_LIST_HEAD(&spec->ae9_mode_controls);
 
 	/* Detect codec quirk */
 	snd_hda_pick_fixup(codec, ca0132_quirk_models, ca0132_quirks, NULL);
@@ -16349,6 +17364,7 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 
 	INIT_DELAYED_WORK(&spec->unsol_hp_work, ca0132_unsol_hp_delayed);
 	INIT_DELAYED_WORK(&spec->ae9_acm_work, ae9_acm_work_fn);
+	INIT_DELAYED_WORK(&spec->ae9_mode_work, ae9_mode_work_fn);
 
 	ca0132_init_chip(codec);
 
@@ -16433,7 +17449,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.2.0-preview30-volume-response1");
+MODULE_VERSION("0.2.0-preview35-pcm-lock1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
