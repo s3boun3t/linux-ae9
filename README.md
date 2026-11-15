@@ -17,8 +17,9 @@ consolidates the AE-9 voice and stability improvements as three DKMS modules: `s
 Playback, ACM controls and microphone operation have been reported working on
 the reference Mint/XanMod system. Microphone jack presence is polled at roughly
 five-second intervals. XLR/TRS detection, surround/optical output and
-suspend/resume are not fully qualified. This candidate adds experimental
-Direct stereo playback; it has not been installed or tested on hardware.
+suspend/resume are not fully qualified. Experimental Direct stereo playback
+was reported working at 48/192 kHz on the reference machine. This candidate
+changes playback volume and has not been installed or tested on hardware.
 
 The driver keeps the microphone handling and complete
 SCP-message serialization. On AE-9, SCP reads now preserve transport errors
@@ -51,11 +52,31 @@ controls also report failures and retain their previous cached values. These
 changes are restricted to AE-9; successful software command sequences do not
 prove physical DAC state or audio quality.
 
-## Direct failure diagnostic build
+## Common DAC playback volume
 
-This build adds failure-stage and rejected-response logs for the observed
-Direct preparation error. Routing and validation checks are unchanged.
-It is an investigation candidate, not a verified fix for the loss of sound.
+Master volume and mute use the ES9038 stereo DAC for SBX, DSP playback
+without effects, and Direct playback. The ACM knob and desktop retain the
+same ALSA controls and dB scale. The HDA output amplifier is set to 0 dB
+and unmuted; DSP playback gain stays at unity. This avoids applying both
+HDA and DAC attenuation to the same signal.
+
+The virtual Master supplies the effective left/right follower levels.
+The driver converts their advertised HDA scale to the DAC's 0.5 dB steps,
+rounding toward more attenuation when necessary. The OLED displays the
+louder channel's commanded DAC level, or MUTE. That command cache is not
+hardware readback or an audio measurement.
+
+User mute is distinct from the temporary mute used during transitions and
+failures. Saved levels are reapplied before startup unmute. Capture gains,
+DAC master trim, volume ramp settings and the other DAC are unchanged.
+No fixed DSP/Direct gain compensation is introduced.
+
+The preceding Direct candidate played audio while Master changed only the
+bypassed HDA amplifier, leaving its audible level unchanged. This candidate
+corrects that command path. Volume, mute, both channels and mode/output
+transitions still need low-level hardware qualification after installation.
+The failure-stage logs for the earlier Direct preparation error are retained;
+that separate error has not been explained by a reproduced failure.
 
 ## Experimental Direct playback
 
@@ -321,8 +342,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -353,7 +374,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation

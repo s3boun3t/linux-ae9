@@ -1302,12 +1302,15 @@ struct ca0132_spec {
 	unsigned char ae5_headphone_gain_val;
 	unsigned char ae5_filter_val;
 	/*
-	 * AE-9 DAC: ae9_dac_mutex protects the register-7 command cache and
-	 * filter/mute updates; command transport then takes mem_mutex.
+	 * AE-9 DAC: ae9_dac_mutex protects the command caches and separate
+	 * user/transport mute policies; transport then takes mem_mutex.
 	 * This cache records commands, not hardware readback.
 	 */
 	struct mutex ae9_dac_mutex;
 	u8 ae9_dac_reg7;
+	u8 ae9_dac_volume[2];
+	bool ae9_dac_user_muted;
+	bool ae9_dac_forced_mute;
 	/* ZxR Control Values */
 	unsigned char zxr_gain_set;
 
@@ -7390,7 +7393,11 @@ static int ae5_sound_filter_put(struct snd_kcontrol *kcontrol,
 static void ae9_dac_init_state(struct ca0132_spec *spec)
 {
 	mutex_init(&spec->ae9_dac_mutex);
-	spec->ae9_dac_reg7 = AE9_DAC_FILTER_DEFAULT;
+	spec->ae9_dac_reg7 = AE9_DAC_FILTER_DEFAULT | 1;
+	spec->ae9_dac_volume[0] = 0xff;
+	spec->ae9_dac_volume[1] = 0xff;
+	spec->ae9_dac_user_muted = true;
+	spec->ae9_dac_forced_mute = true;
 }
 
 static int ae9_sound_filter_info(struct snd_kcontrol *kcontrol,
@@ -8085,7 +8092,7 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
  */
 /*
  * DSP gain handling for the alternative controls. AE-9 capture matches ADC
- * and DSP gains; playback keeps DSP gains at 0 dB while HDA controls its level.
+ * and DSP gains; AE-9 playback keeps HDA/DSP at 0 dB and uses DAC volume.
  */
 /*
  * Earlier playback tests reported a stale module gain persisting until the
@@ -8114,7 +8121,121 @@ static int ae9_dsp_volume_unity(struct hda_codec *codec)
 	return 0;
 }
 
-/* Use the same HDA dB steps that ALSA advertises, without a second curve. */
+/* Convert ALSA's quarter-dB amp scale to ES9038 half-dB attenuation. */
+static int ae9_dac_attenuation(unsigned int caps, long level)
+{
+	unsigned int offset, steps, step, attenuation;
+
+	if (!caps || caps == ~0U)
+		return -EIO;
+	offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
+	steps = (caps & AC_AMPCAP_NUM_STEPS) >> AC_AMPCAP_NUM_STEPS_SHIFT;
+	step = ((caps & AC_AMPCAP_STEP_SIZE) >> AC_AMPCAP_STEP_SIZE_SHIFT) + 1;
+	if (level < 0 || level > steps || level > offset)
+		return -EINVAL;
+	if (!level && (caps & AC_AMPCAP_MIN_MUTE))
+		return 0xff;
+	/* Round toward more attenuation; never exceed the requested level. */
+	attenuation = DIV_ROUND_UP((offset - level) * step, 2);
+	if (attenuation > 0xff)
+		return -ERANGE;
+	return attenuation;
+}
+
+/* Output mutex owns logical levels; DAC mutex serializes both channels. */
+static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
+				bool left_on, bool right_on)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
+	bool muted;
+	int lval, rval;
+	u8 reg7;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	lval = ae9_dac_attenuation(caps, left);
+	if (lval < 0)
+		return lval;
+	rval = ae9_dac_attenuation(caps, right);
+	if (rval < 0)
+		return rval;
+	left_on &= left || !(caps & AC_AMPCAP_MIN_MUTE);
+	right_on &= right || !(caps & AC_AMPCAP_MIN_MUTE);
+	if (!left_on)
+		lval = 0xff;
+	if (!right_on)
+		rval = 0xff;
+	muted = !left_on && !right_on;
+
+	guard(mutex)(&spec->ae9_dac_mutex);
+	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U)
+		return -ENODEV;
+	/* ESS digital volume is unavailable with the oversampling bypassed. */
+	if (spec->ae9_dac_reg7 & BIT(1))
+		return -EOPNOTSUPP;
+	reg7 = (spec->ae9_dac_reg7 & ~1) |
+		(spec->ae9_dac_forced_mute || muted);
+	/* Assert mute before changing levels; release it only after both writes. */
+	if ((reg7 & 1) && reg7 != spec->ae9_dac_reg7)
+		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
+	ca0113_mmio_command_set(codec, 0x48, 0x0f, lval);
+	ca0113_mmio_command_set(codec, 0x48, 0x10, rval);
+	if (!(reg7 & 1) && reg7 != spec->ae9_dac_reg7)
+		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
+	spec->ae9_dac_reg7 = reg7;
+	spec->ae9_dac_volume[0] = lval;
+	spec->ae9_dac_volume[1] = rval;
+	spec->ae9_dac_user_muted = muted;
+	return 0;
+}
+
+static int ae9_dac_volume_restore_locked(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int idx = VNID_SPK - VNODE_START_NID;
+
+	return ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
+				    spec->vnode_rvol[idx], spec->vnode_lswitch[idx],
+				    spec->vnode_rswitch[idx]);
+}
+
+/* HDA/DSP must not add a second attenuation to the common DAC volume. */
+static int ae9_hda_volume_unity(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
+	unsigned int offset;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
+	err = ae9_dac_attenuation(caps, offset);
+	if (err < 0)
+		return err;
+	guard(mutex)(&codec->control_mutex);
+	err = snd_hda_codec_amp_stereo(codec, 0x02, HDA_OUTPUT, 0,
+				       HDA_AMP_VOLMASK | HDA_AMP_MUTE, offset);
+	return err < 0 ? err : 0;
+}
+
+/* The virtual Master supplies effective follower values, not a second gain. */
+static int ae9_master_get(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	int idx = VNID_SPK - VNODE_START_NID;
+	long *valp = ucontrol->value.integer.value;
+	int ch = get_amp_channels(kcontrol);
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (ch & 1)
+		*valp++ = spec->vnode_lvol[idx];
+	if (ch & 2)
+		*valp = spec->vnode_rvol[idx];
+	return 0;
+}
+
 static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 			    struct snd_ctl_elem_value *ucontrol)
 {
@@ -8122,27 +8243,82 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	long *valp = ucontrol->value.integer.value;
 	int ch = get_amp_channels(kcontrol);
-	int err;
+	int idx = VNID_SPK - VNODE_START_NID;
+	long left, right;
+	int err, changed;
 
 	CLASS(snd_hda_power, pm)(codec);
-	if (pm.err < 0)
-		return pm.err;
-	guard(mutex)(&codec->control_mutex);
-	if (!READ_ONCE(spec->ae9_direct.enabled)) {
-		err = ae9_dsp_volume_unity(codec);
-		if (err < 0)
-			return err;
-	}
-	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
-	/* A failed stereo put may already have changed one channel. */
-	ae9_acm_display_changed(spec);
+	err = ae9_pm_error(codec, pm.err);
 	if (err < 0)
 		return err;
+	guard(mutex)(&spec->ae9_output_mutex);
+	left = spec->vnode_lvol[idx];
+	right = spec->vnode_rvol[idx];
 	if (ch & 1)
-		spec->vnode_lvol[VNID_SPK - VNODE_START_NID] = *valp++;
+		left = *valp++;
 	if (ch & 2)
-		spec->vnode_rvol[VNID_SPK - VNODE_START_NID] = *valp;
-	return err;
+		right = *valp;
+	err = ae9_dac_volume_apply(codec, left, right, spec->vnode_lswitch[idx],
+				   spec->vnode_rswitch[idx]);
+	if (err < 0)
+		return err;
+	changed = left != spec->vnode_lvol[idx] || right != spec->vnode_rvol[idx];
+	spec->vnode_lvol[idx] = left;
+	spec->vnode_rvol[idx] = right;
+	ae9_acm_display_changed(spec);
+	return changed;
+}
+
+static int ae9_master_switch_get(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	int idx = VNID_SPK - VNODE_START_NID;
+	long *valp = ucontrol->value.integer.value;
+	int ch = get_amp_channels(kcontrol);
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (ch & 1)
+		*valp++ = spec->vnode_lswitch[idx];
+	if (ch & 2)
+		*valp = spec->vnode_rswitch[idx];
+	return 0;
+}
+
+static int ae9_master_switch_put(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	int idx = VNID_SPK - VNODE_START_NID;
+	long *valp = ucontrol->value.integer.value;
+	int ch = get_amp_channels(kcontrol);
+	long left, right;
+	int err, changed;
+
+	CLASS(snd_hda_power, pm)(codec);
+	err = ae9_pm_error(codec, pm.err);
+	if (err < 0)
+		return err;
+	guard(mutex)(&spec->ae9_output_mutex);
+	left = spec->vnode_lswitch[idx];
+	right = spec->vnode_rswitch[idx];
+	if (ch & 1)
+		left = *valp++;
+	if (ch & 2)
+		right = *valp;
+	if (left < 0 || left > 1 || right < 0 || right > 1)
+		return -EINVAL;
+	err = ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
+				   spec->vnode_rvol[idx], left, right);
+	if (err < 0)
+		return err;
+	changed = left != spec->vnode_lswitch[idx] || right != spec->vnode_rswitch[idx];
+	spec->vnode_lswitch[idx] = left;
+	spec->vnode_rswitch[idx] = right;
+	ae9_acm_display_changed(spec);
+	return changed;
 }
 
 /* Caller holds the voice and control mutexes. Keep ALSA's existing curve. */
@@ -8852,8 +9028,27 @@ static const struct snd_kcontrol_new desktop_mixer[] = {
  * output element and follows volume/mute on both ports instead.
  */
 static const struct snd_kcontrol_new ae9_shared_mixer[] = {
-	CA0132_ALT_CODEC_VOL("Headphone+LO Playback Volume", 0x02, HDA_OUTPUT),
-	CA0132_CODEC_MUTE("Headphone+LO Playback Switch", VNID_SPK, HDA_OUTPUT),
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Headphone+LO Playback Volume",
+		.subdevice = HDA_SUBDEV_AMP_FLAG,
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
+			  SNDRV_CTL_ELEM_ACCESS_TLV_READ |
+			  SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK,
+		.info = snd_hda_mixer_amp_volume_info,
+		.get = ae9_master_get,
+		.put = ae9_master_apply,
+		.tlv = { .c = snd_hda_mixer_amp_tlv },
+		.private_value = HDA_COMPOSE_AMP_VAL(0x02, 3, 0, HDA_OUTPUT),
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Headphone+LO Playback Switch",
+		.info = snd_hda_mixer_amp_switch_info,
+		.get = ae9_master_switch_get,
+		.put = ae9_master_switch_put,
+		.private_value = HDA_COMPOSE_AMP_VAL(0x02, 3, 0, HDA_OUTPUT),
+	},
 	{ } /* end */
 };
 
@@ -9668,6 +9863,12 @@ static int ae9_resume_routes(struct hda_codec *codec)
 	int err;
 
 	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		err = ae9_dac_volume_restore_locked(codec);
+		if (err < 0)
+			return err;
+		err = ae9_hda_volume_unity(codec);
+		if (err < 0)
+			return err;
 		if (!spec->ae9_output_applied) {
 			err = __ca0132_alt_select_out(codec);
 			if (err < 0)
@@ -11315,6 +11516,8 @@ static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned in
 	guard(mutex)(&spec->ae9_dac_mutex);
 	val = (val & ~AE9_DAC_FILTER_MASK) |
 		(spec->ae9_dac_reg7 & AE9_DAC_FILTER_MASK);
+	spec->ae9_dac_forced_mute = val & 1;
+	val |= spec->ae9_dac_user_muted;
 	ca0113_mmio_command_set(codec, 0x48, reg, val);
 	spec->ae9_dac_reg7 = val;
 }
@@ -11542,12 +11745,17 @@ static int ae9_direct_mute(struct hda_codec *codec, bool mute)
 	u8 value;
 
 	guard(mutex)(&spec->ae9_dac_mutex);
+	/* A failed transport must not let a later volume request release mute. */
+	if (mute)
+		spec->ae9_dac_forced_mute = true;
 	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U)
 		return -ENODEV;
-	value = (spec->ae9_dac_reg7 & ~1) | mute;
+	value = (spec->ae9_dac_reg7 & ~1) |
+		(mute || spec->ae9_dac_user_muted);
 	/* No DAC acknowledgment: this remains a command cache. */
 	ca0113_mmio_command_set(codec, 0x48, 0x07, value);
 	spec->ae9_dac_reg7 = value;
+	spec->ae9_dac_forced_mute = mute;
 	return 0;
 }
 
@@ -11845,7 +12053,7 @@ static int ae9_direct_prepare_locked(struct hda_codec *codec,
 	direct->prepared = false;
 	if (!direct->touched) {
 		guard(mutex)(&spec->ae9_dac_mutex);
-		direct->saved_mute = spec->ae9_dac_reg7 & 1;
+		direct->saved_mute = spec->ae9_dac_forced_mute;
 	}
 	direct->touched = true;
 	muted = direct->saved_mute;
@@ -12170,8 +12378,6 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 		{ 0x14, 0x7f },
 		{ 0x0e, 0x8a },
 		{ 0x07, 0x81 },
-		{ 0x0f, 0x00 },
-		{ 0x10, 0x00 },
 		{ 0x0a, 0x02 },
 	};
 	static const struct ae9_reg_val d49_init[] = {
@@ -13361,52 +13567,22 @@ static long ae9_master_level(struct hda_codec *codec,
 	return v;
 }
 
-static bool ae9_master_muted(struct hda_codec *codec)
-{
-	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, "Master Playback Switch");
-	struct snd_ctl_elem_value *uctl;
-	bool muted = false;
-
-	if (!kctl || !kctl->get)
-		return false;
-	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
-	if (!uctl)
-		return false;
-	if (kctl->get(kctl, uctl) >= 0)
-		muted = !uctl->value.integer.value[0];
-	kfree(uctl);
-	return muted;
-}
-
 static void ae9_acm_show_volume(struct ca0132_spec *spec)
 {
-	struct hda_codec *codec = spec->codec;
-	unsigned int caps;
-	int left, right, offset, step, db100;
+	int attenuation;
+	bool muted;
 	char txt[9];
 
-	if (ae9_master_muted(codec)) {
+	scoped_guard(mutex, &spec->ae9_dac_mutex) {
+		muted = spec->ae9_dac_user_muted;
+		attenuation = min(spec->ae9_dac_volume[0], spec->ae9_dac_volume[1]);
+	}
+	if (muted) {
 		snprintf(txt, sizeof(txt), "MUTE");
 	} else {
-		/* Show the louder channel after Master and follower attenuation. */
-		scoped_guard(mutex, &codec->control_mutex) {
-			left = snd_hda_codec_amp_read(codec, 0x02, 0,
-						      HDA_OUTPUT, 0);
-			right = snd_hda_codec_amp_read(codec, 0x02, 1,
-						       HDA_OUTPUT, 0);
-		}
-		caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
-		if (left < 0 || right < 0 || caps == ~0U) {
-			ae9_acm_display_changed(spec);
-			return;
-		}
-		offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
-		step = ((caps & AC_AMPCAP_STEP_SIZE) >>
-			AC_AMPCAP_STEP_SIZE_SHIFT) + 1;
-		db100 = (max(left & HDA_AMP_VOLMASK,
-			     right & HDA_AMP_VOLMASK) - offset) * step * 25;
-		snprintf(txt, sizeof(txt), "%s%d.%d", db100 < 0 ? "-" : "",
-			 abs(db100) / 100, (abs(db100) % 100) / 10);
+		/* Display the louder channel's commanded DAC attenuation. */
+		snprintf(txt, sizeof(txt), "%s%d.%d", attenuation ? "-" : "",
+			 attenuation / 2, (attenuation % 2) * 5);
 	}
 	if (!ae9_acm_display_allowed(spec))
 		return;
@@ -13599,7 +13775,7 @@ static int ae9_direct_output_locked(struct hda_codec *codec)
 	lockdep_assert_held(&spec->ae9_output_mutex);
 	if (restore) {
 		scoped_guard(mutex, &spec->ae9_dac_mutex)
-			muted = spec->ae9_dac_reg7 & 1;
+			muted = spec->ae9_dac_forced_mute;
 		err = ae9_direct_mute(codec, true);
 		if (err < 0)
 			goto fail;
@@ -14185,6 +14361,11 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	if (err < 0)
 		goto fail;
 	ae9_post_dsp_dac_init(codec);		/* ES9038 and device 0x49 registers. */
+	stage = "DAC volume";
+	scoped_guard(mutex, &spec->ae9_output_mutex)
+		err = ae9_dac_volume_restore_locked(codec);
+	if (err < 0)
+		goto fail;
 	ae9_post_dsp_finish(codec);		/* GPIO4 and DAC unmute. */
 	if (ae9_mic) {
 		ca0132_alt_dsp_initial_mic_setup(codec);
@@ -15591,6 +15772,12 @@ static int ca0132_init(struct hda_codec *codec)
 		init_input(codec, spec->input_pins[i], spec->adcs[i]);
 
 	init_input(codec, cfg->dig_in_pin, spec->dig_in);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		scoped_guard(mutex, &spec->ae9_output_mutex)
+			err = ae9_hda_volume_unity(codec);
+		if (err < 0)
+			return ae9_dsp_init_failed(codec, err);
+	}
 
 	if (!ca0132_use_alt_functions(spec)) {
 		snd_hda_sequence_write(codec, spec->chip_init_verbs);
@@ -16227,7 +16414,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.2.0-preview28-direct-diag1");
+MODULE_VERSION("0.2.0-preview29-dac-volume1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
