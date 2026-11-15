@@ -4416,8 +4416,9 @@ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
  * group, target and value. Preserve the existing reads: early tests without
  * them left the card unresponsive; their exact side effects remain uncertain.
  */
-static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
-		unsigned int target, unsigned int value)
+static void ca0113_mmio_command_set_delay(struct hda_codec *codec,
+					  unsigned int group, unsigned int target,
+					  unsigned int value, bool fast)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int write_val;
@@ -4438,10 +4439,11 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 
 
 	ca0113_mmio_writel(spec, 0x204, write_val);
-	/*
-	 * Need delay here or else it goes too fast and works inconsistently.
-	 */
-	msleep(20);
+	/* Live AE-9 volume follows 3xHelix's 4 ms settle; setup keeps 20 ms. */
+	if (fast)
+		usleep_range(4000, 4500);
+	else
+		msleep(20);
 
 	readl(spec->mem_base + 0x860);
 	readl(spec->mem_base + 0x854);
@@ -4451,6 +4453,12 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	ca0113_mmio_writel(spec, 0x210, 0x00000000);
 	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
+}
+
+static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
+				    unsigned int target, unsigned int value)
+{
+	ca0113_mmio_command_set_delay(codec, group, target, value, false);
 }
 
 /*
@@ -8147,7 +8155,7 @@ static int ae9_dac_attenuation(unsigned int caps, long level)
 
 /* Output mutex owns logical levels; DAC mutex serializes both channels. */
 static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
-				bool left_on, bool right_on)
+				bool left_on, bool right_on, bool fast)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
@@ -8181,8 +8189,8 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 	/* Assert mute before changing levels; release it only after both writes. */
 	if ((reg7 & 1) && reg7 != spec->ae9_dac_reg7)
 		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
-	ca0113_mmio_command_set(codec, 0x48, 0x0f, lval);
-	ca0113_mmio_command_set(codec, 0x48, 0x10, rval);
+	ca0113_mmio_command_set_delay(codec, 0x48, 0x0f, lval, fast);
+	ca0113_mmio_command_set_delay(codec, 0x48, 0x10, rval, fast);
 	if (!(reg7 & 1) && reg7 != spec->ae9_dac_reg7)
 		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
 	spec->ae9_dac_reg7 = reg7;
@@ -8199,7 +8207,7 @@ static int ae9_dac_volume_restore_locked(struct hda_codec *codec)
 
 	return ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
 				    spec->vnode_rvol[idx], spec->vnode_lswitch[idx],
-				    spec->vnode_rswitch[idx]);
+				    spec->vnode_rswitch[idx], false);
 }
 
 /* HDA/DSP must not add a second attenuation to the common DAC volume. */
@@ -8262,7 +8270,7 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	if (ch & 2)
 		right = *valp;
 	err = ae9_dac_volume_apply(codec, left, right, spec->vnode_lswitch[idx],
-				   spec->vnode_rswitch[idx]);
+				   spec->vnode_rswitch[idx], true);
 	if (err < 0)
 		return err;
 	changed = left != spec->vnode_lvol[idx] || right != spec->vnode_rvol[idx];
@@ -8314,7 +8322,7 @@ static int ae9_master_switch_put(struct snd_kcontrol *kcontrol,
 	if (left < 0 || left > 1 || right < 0 || right > 1)
 		return -EINVAL;
 	err = ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
-				   spec->vnode_rvol[idx], left, right);
+				   spec->vnode_rvol[idx], left, right, false);
 	if (err < 0)
 		return err;
 	changed = left != spec->vnode_lswitch[idx] || right != spec->vnode_rswitch[idx];
@@ -16425,7 +16433,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.2.0-preview29-dac-volume1");
+MODULE_VERSION("0.2.0-preview30-volume-response1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

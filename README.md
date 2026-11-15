@@ -71,6 +71,14 @@ failures. Saved levels are reapplied before startup unmute. Capture gains,
 DAC master trim, volume ramp settings and the other DAC are unchanged.
 No fixed DSP/Direct gain compensation is introduced.
 
+Live volume changes use a 4–4.5 ms settle per DAC level command, following
+3xHelix revision 9a661afe. The two commands therefore request 8–9 ms of
+settling instead of 40 ms; scheduler and I/O time come in addition. Mute,
+startup and restoration retain their existing 20 ms waits. Writes remain
+synchronous so the desktop receives completion after the DAC commands.
+This reduces control latency; removal of audible interruptions during rapid
+volume changes still requires a hardware trial.
+
 The preceding Direct candidate played audio while Master changed only the
 bypassed HDA amplifier, leaving its audible level unchanged. This candidate
 corrects that command path. Volume, mute, both channels and mode/output
@@ -346,8 +354,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -378,7 +386,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview29-dac-volume1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview30-volume-response1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation
