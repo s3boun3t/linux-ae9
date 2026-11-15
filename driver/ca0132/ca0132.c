@@ -1357,6 +1357,9 @@ struct ca0132_spec {
 	/* Display phases/deadlines are protected by ae9_acm_work_lock. */
 	int ae9_acm_display_phase;
 	unsigned long ae9_acm_display_until;
+	/* Last output label is private to the ACM service worker. */
+	bool ae9_acm_label_valid;
+	int ae9_acm_label_output;
 	int ae9_acm_turbo;		/* service turbo ticks left */
 	/* Display dirty/UI requests use ae9_acm_work_lock. */
 	bool ae9_acm_disp_dirty;	/* volume changed: refresh the display */
@@ -13489,8 +13492,11 @@ static void ae9_acm_advance_display(struct ca0132_spec *spec)
 			return;
 		ae9_acm_display(spec, spec->cur_out_type == HEADPHONE_OUT ?
 				"-HP-" : "-SP-");
-		if (!READ_ONCE(spec->ae9_acm_tx_failed))
+		if (!READ_ONCE(spec->ae9_acm_tx_failed)) {
+			spec->ae9_acm_label_output = spec->cur_out_type;
+			spec->ae9_acm_label_valid = true;
 			ae9_acm_set_display_phase(spec, AE9_ACM_DISPLAY_MODE);
+		}
 	} else if (phase == AE9_ACM_DISPLAY_MODE) {
 		ae9_acm_set_display_phase(spec, AE9_ACM_DISPLAY_VOLUME);
 		ae9_acm_display_changed(spec);
@@ -13849,12 +13855,17 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
 		goto out;
 	ae9_apply_output_path(codec);
-	/* A mode change during the logo updates hardware but keeps its hold. */
-	if (spec->ae9_acm_display_phase != AE9_ACM_DISPLAY_LOGO) {
+	/* Reapplying the same output must not restart its label hold. */
+	if (spec->ae9_acm_display_phase != AE9_ACM_DISPLAY_LOGO &&
+	    (!spec->ae9_acm_label_valid ||
+	     spec->ae9_acm_label_output != spec->cur_out_type)) {
 		ae9_acm_display(spec, spec->cur_out_type == HEADPHONE_OUT ?
 				"-HP-" : "-SP-");
-		if (!READ_ONCE(spec->ae9_acm_tx_failed))
+		if (!READ_ONCE(spec->ae9_acm_tx_failed)) {
+			spec->ae9_acm_label_output = spec->cur_out_type;
+			spec->ae9_acm_label_valid = true;
 			ae9_acm_set_display_phase(spec, AE9_ACM_DISPLAY_MODE);
+		}
 	}
 out:
 	mutex_unlock(&spec->ae9_output_mutex);

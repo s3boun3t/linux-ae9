@@ -172,6 +172,10 @@ holds; knob turbo does not shorten them. UART exchanges retain their existing
 wait limits. With polling disabled, initialization still shows volume and
 parks the worker. Long SBX presses remain ignored.
 
+Reopening playback or switching DSP/Direct with the same selected output
+keeps the volume display. HP/SP is announced when the output changes,
+at startup and after ACM recovery.
+
 The preceding ACM recovery build was installed on the reference system.
 Automatic reattachment after a configuration loss has not been exercised on
 hardware. The preceding revision corrected and shortened source comments.

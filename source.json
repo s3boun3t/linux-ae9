@@ -1,7 +1,7 @@
 {
   "driver_reference": "Published ACM/comments base plus experimental Direct diagnostics and common ES9038 playback volume",
   "reference_commit": "faa8875b07725bee7c7f5320676ba8e742bbc739",
-  "codec_sha256": "20c4ccc2777b97374a0eaaaa239cffd43050efc6ba99998acb89d2523e254d62",
+  "codec_sha256": "44f8101ff7fe921c06fa1f0ec33d25cfdb780d5ad6bdad8d056386dc818208b9",
   "hda_core_reference": "XanMod 7.3.3 source, commit 2ef81154eee5e08d29749ce752a39fb10b8426d7, with reviewed AE-9 differences",
   "development_kernel_adaptations": false,
   "status": "Local common-DAC-volume candidate for 7.3.3-x64v3-xanmod1; not installed; volume/mute/transitions and resume require hardware qualification",
