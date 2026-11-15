@@ -89,6 +89,36 @@ This stage is rirbread1. It retains the exact PCI scope for AE-9 special
 handling. ICW recovery and bounded RIRB rereads are not evidence that the
 initial timeout is fixed. No earlyquirk1 refactor is included.
 
+## ACM recovery and display
+
+The ACM marker read is validated before its value is used. A reported loss
+of setup invalidates jack observations and suppresses their use until setup
+frames have been sent and the expected marker is observed again. Unknown or
+malformed marker replies do not authorize recovery. Replay is limited to
+three attempts per detected loss; existing transmit fault latches stay set.
+
+The replay uses the current headphone/speaker and SBX state. It sends ACM
+frames only, without a DAC reset, GPIO power cycle, HDA volume/mute update,
+or microphone gain/phantom command. The first fresh headphone sample after
+recovery establishes a new baseline and preserves the selected output.
+Existing recovery after six missing keepalives also invalidates jack reports.
+A cleared microphone jack report means presence is no longer trusted; it
+changes neither the selected input nor its gain.
+
+With polling enabled, the OLED holds AE-9 for at least five seconds, then
+the current HP/SP label for at least five seconds, then displays the current
+volume. The existing worker advances deadlines without sleeping for these
+holds; knob turbo does not shorten them. UART exchanges retain their existing
+wait limits. With polling disabled, initialization still shows volume and
+parks the worker. Long SBX presses remain ignored.
+
+The preceding ACM recovery build was installed on the reference system.
+Automatic reattachment after a configuration loss has not been exercised on
+hardware. This revision also corrects and shortens source comments without
+changing the ACM behavior. These software guards do not prove that the
+physical ACM retained all settings. The shared HDA sources are unchanged
+from the preceding rirbread1 package.
+
 ## Compatibility
 
 This experimental HDA package targets **7.3.3-x64v3-xanmod1 on x86_64 only**.
@@ -251,8 +281,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview24-hda-rirb1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview24-hda-rirb1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -283,7 +313,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview24-hda-rirb1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation

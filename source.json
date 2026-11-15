@@ -1,20 +1,20 @@
 {
-  "driver_reference": "Codec series plus experimental HDA stage rirbread1",
-  "reference_commit": "fd2404434e42d6eaebaf9e90267103b6e47eaae7",
-  "codec_sha256": "dc72c84d91703175131a157e8bc31078f5f78565a9f0f2ff245c396c3ee2f370",
+  "driver_reference": "Published rirbread1 package plus ACM recovery, timed display and corrected CA0132 comments",
+  "reference_commit": "b87cd312585ea71c430702b0285379ef1cc212f1",
+  "codec_sha256": "77dd5a543b2d1fbf31ba872fb1a823064c2fe48d62791b4244af0d44216eb75e",
   "hda_core_reference": "XanMod 7.3.3 source, commit 2ef81154eee5e08d29749ce752a39fb10b8426d7, with reviewed AE-9 differences",
   "development_kernel_adaptations": false,
-  "status": "Experimental local HDA preparation; target 7.3.3-x64v3-xanmod1; hardware qualification and compatible public CI pending",
-  "reference_commit_scope": "Local parent of the five experimental HDA commits; codec_sha256 identifies the exact source",
+  "status": "Experimental ACM recovery package for 7.3.3-x64v3-xanmod1; preceding recovery build installed; recovery after configuration loss not hardware-qualified",
+  "reference_commit_scope": "Published parent before the local ACM changes; codec_sha256 identifies this exact candidate",
   "consolidated_vc2_codec_sha256": "52519d3fdd5d0da45628888bd5ce7f283e9dc2b5340d550d7cec9a3da52f4270",
   "stability1_codec_sha256": "6f79fb26ae55d1d97dd9b87f762e9aa7a20aaa45be7c5186a552d19cbc2e5efe",
   "stability2_tested_codec_sha256": "8d7ed379b00c0baad27597cb255dda291250195f89b28b29408cc723c1279fac",
   "packaging_revision": "Three coherent modules for the exact pinned kernel; do not mix with codec-only package",
-  "package_version": "0.2.0-preview24-hda-rirb1",
-  "source_scope": "Five requested historical HDA changes only; earlyquirk1 excluded",
+  "package_version": "0.2.0-preview26-acm-comments1",
+  "source_scope": "CA0132 only: marker prerequisite, jack invalidation, bounded ACM setup replay, timed OLED and comment corrections; no THD or long-SBX display toggle",
   "hda_core_sha256": "ceb5e335b56c2b1df3545d2551e19858532d5e08952b9dfc46f28a6661196c91",
   "hda_common_controller_sha256": "6cfecb893fb6207be1e3577495b6808a47fa3825b4ada843401fd0ea470d0735",
   "ci_compatible": false,
   "hda_stage": "rirbread1",
-  "published_base_commit": "684ea5f46c3d5e92837336f3c1458b2e6c963857"
+  "published_base_commit": "b87cd312585ea71c430702b0285379ef1cc212f1"
 }
