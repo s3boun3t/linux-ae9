@@ -17,8 +17,8 @@ consolidates the AE-9 voice and stability improvements as three DKMS modules: `s
 Playback, ACM controls and microphone operation have been reported working on
 the reference Mint/XanMod system. Microphone jack presence is polled at roughly
 five-second intervals. XLR/TRS detection, surround/optical output and
-suspend/resume are not fully qualified. Direct mode and automatic native
-sample-rate switching are not included in this branch.
+suspend/resume are not fully qualified. This candidate adds experimental
+Direct stereo playback; it has not been installed or tested on hardware.
 
 The driver keeps the microphone handling and complete
 SCP-message serialization. On AE-9, SCP reads now preserve transport errors
@@ -50,6 +50,45 @@ An explicit selection or codec init can restore the route. Speaker configuration
 controls also report failures and retain their previous cached values. These
 changes are restricted to AE-9; successful software command sequences do not
 prove physical DAC state or audio quality.
+
+## Direct failure diagnostic build
+
+This build adds failure-stage and rejected-response logs for the observed
+Direct preparation error. Routing and validation checks are unchanged.
+It is an investigation candidate, not a verified fix for the loss of sound.
+
+## Experimental Direct playback
+
+`AE-9: Direct Mode Switch` selects stereo playback without the playback DSP
+processing path. It is off by default and is available in alsamixer or
+amixer. Close playback, microphone and What U Hear streams before changing
+it; an open stream makes the change return `-EBUSY`. Desktop audio software
+may keep streams open even when no application is playing.
+
+Direct playback accepts two channels in `S32_LE` at 48, 96 or 192 kHz.
+Other rates, including 44.1 and 384 kHz, are rejected. The first version
+covers ACM headphones and front RCA. Multichannel, optical and DSD Direct
+playback are outside its scope. The firmware remains loaded for control and
+capture. The negotiated PCM rate and transport format do not demonstrate
+the physical DAC clock or 32-bit analog precision.
+
+Playback effects and EQ become inactive while their saved settings are
+retained. The ACM SBX button is ignored and its LED stays off. Output
+selection, Master volume, mute, the ACM knob and DAC filter remain available.
+The original playback capabilities and saved effects return in DSP mode.
+Transitions are muted; failed programming detaches playback and reports an
+error rather than silently using the DSP path.
+
+Microphone capture and Voice Clarity remain independent. The existing
+`Enable InFX Capture Switch` can disable voice effects, but it is not a
+complete hardware DSP bypass. What U Hear returns `-EOPNOTSUPP` in Direct.
+PipeWire or applications may still mix or resample before the card; this
+switch alone does not guarantee bit-perfect playback.
+
+This is a software-checked candidate. Before normal listening, separately
+validate volume and mute at low level, both channels, all three rates,
+return to DSP, microphone duplex, suspend/resume and ACM recovery. No fixed
+gain offset is applied between DSP and Direct.
 
 ## Additional codec changes in this preview
 
@@ -114,10 +153,11 @@ parks the worker. Long SBX presses remain ignored.
 
 The preceding ACM recovery build was installed on the reference system.
 Automatic reattachment after a configuration loss has not been exercised on
-hardware. This revision also corrects and shortens source comments without
-changing the ACM behavior. These software guards do not prove that the
-physical ACM retained all settings. The shared HDA sources are unchanged
-from the preceding rirbread1 package.
+hardware. The preceding revision corrected and shortened source comments.
+Direct mode keeps the ACM recovery path while suppressing its SBX requests.
+These software guards do not prove that the physical ACM retained all
+settings. The shared HDA sources are unchanged from the preceding
+rirbread1 package.
 
 ## Compatibility
 
@@ -281,8 +321,8 @@ From the repository root, for the currently running, supported kernel:
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
 ```
 
 If this exact package version is already registered, skip `dkms add .`.
@@ -313,7 +353,7 @@ To remove this version from the target kernel:
 
 ```sh
 target_kernel="$(uname -r)"
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview26-acm-comments1 -k "$target_kernel"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview28-direct-diag1 -k "$target_kernel"
 ```
 
 Refresh its initramfs if needed and reboot. If an earlier manual installation

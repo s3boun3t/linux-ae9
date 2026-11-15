@@ -1180,6 +1180,44 @@ struct ae9_voice_state {
 
 /* AE9_VOICE_TYPES_END */
 
+#define AE9_PCM_PLAYBACK	BIT(0)
+#define AE9_PCM_MIC	BIT(1)
+#define AE9_PCM_WUH	BIT(2)
+#define AE9_DIRECT_MAX_SLOTS	8
+#define AE9_DIRECT_ROUTER_ENTRIES	128
+#define AE9_8051_QUEUE_DEPTH	0xf04
+
+struct ae9_direct_rate {
+	unsigned int rate;
+	u8 code;
+	u8 slots;
+	u32 clock;
+	u32 divisor;
+};
+
+static const struct ae9_direct_rate ae9_direct_rates[] = {
+	{ 48000, SR_48_000, 2, 0x0001f100, 0x00008005 },
+	{ 96000, SR_96_000, 4, 0x0001f101, 0x00014004 },
+	{ 192000, SR_192_000, 8, 0x0001f102, 0x00022003 },
+};
+
+/* Protected by ae9_output_mutex. Firmware stays loaded in Direct mode. */
+struct ae9_direct_state {
+	bool enabled;
+	bool touched;
+	bool valid;
+	bool prepared;
+	unsigned int opened;
+	unsigned int rate;
+	unsigned int maxbps;
+	bool caps_saved;
+	bool saved_mute;
+	const char *stage;
+	bool dsp_pair_valid;
+	u8 dsp_slots[2];
+	u8 dsp_sources[2];
+};
+
 struct ca0132_spec {
 	const struct snd_kcontrol_new *mixers[5];
 	unsigned int num_mixers;
@@ -1348,6 +1386,7 @@ struct ca0132_spec {
 	struct mutex ae9_output_mutex;
 	/* Protected by ae9_output_mutex; route complete, not an FX snapshot. */
 	bool ae9_output_applied;
+	struct ae9_direct_state ae9_direct;
 	/* Lock order: power reference, voice, control, SCP, ChipIO/memory. */
 	struct ae9_voice_state ae9_voice;
 	/* Serializes complete SCP messages and their shared reply state. */
@@ -1407,6 +1446,13 @@ static int ae9_control_param(struct hda_codec *codec, unsigned int id,
 static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source);
 static int ae9_voice_boost_put(struct hda_codec *codec, unsigned int boost);
 static void ae9_voice_invalidate_input_locked(struct ae9_voice_state *voice);
+static int ae9_direct_prepare_locked(struct hda_codec *codec,
+				     unsigned int rate, unsigned int tag, unsigned int format);
+static int ae9_direct_restore_locked(struct hda_codec *codec);
+static int ae9_direct_mute(struct hda_codec *codec, bool mute);
+static int ae9_direct_output_locked(struct hda_codec *codec);
+static int __ca0132_alt_select_out(struct hda_codec *codec);
+static void ae9_direct_controls(struct hda_codec *codec, bool active);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -4731,6 +4777,112 @@ static long ca0132_effect_switch_state(struct ca0132_spec *spec, hda_nid_t nid)
 
 static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when);
 
+static const struct ae9_direct_rate *ae9_direct_rate(unsigned int rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ae9_direct_rates); i++)
+		if (ae9_direct_rates[i].rate == rate)
+			return &ae9_direct_rates[i];
+	return NULL;
+}
+
+static int ae9_direct_open_locked(struct ca0132_spec *spec, unsigned int bit)
+{
+	if (bit == AE9_PCM_WUH && spec->ae9_direct.enabled)
+		return -EOPNOTSUPP;
+	if (spec->ae9_direct.opened & bit)
+		return -EBUSY;
+	spec->ae9_direct.opened |= bit;
+	return 0;
+}
+
+static void ae9_direct_close_locked(struct ca0132_spec *spec, unsigned int bit)
+{
+	spec->ae9_direct.opened &= ~bit;
+}
+
+static int ae9_direct_set_locked(struct ca0132_spec *spec, bool enabled)
+{
+	if (enabled == spec->ae9_direct.enabled)
+		return 0;
+	if (spec->ae9_direct.opened)
+		return -EBUSY;
+	spec->ae9_direct.enabled = enabled;
+	spec->ae9_direct.valid = false;
+	return 1;
+}
+
+static int ae9_playback_open(struct hda_pcm_stream *hinfo,
+			     struct hda_codec *codec, struct snd_pcm_substream *substream)
+{
+	static const unsigned int rates[] = { 48000, 96000, 192000 };
+	static const struct snd_pcm_hw_constraint_list list = {
+		.count = ARRAY_SIZE(rates), .list = rates,
+	};
+	struct ca0132_spec *spec = codec->spec;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int err;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	err = ae9_direct_open_locked(spec, AE9_PCM_PLAYBACK);
+	if (err < 0)
+		return err;
+	if (!spec->ae9_direct.caps_saved) {
+		spec->ae9_direct.maxbps = hinfo->maxbps;
+		spec->ae9_direct.caps_saved = true;
+	}
+	if (!spec->ae9_direct.enabled)
+		return 0;
+	/* The HDA controller computes its format after this callback. */
+	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000 |
+			    SNDRV_PCM_RATE_192000;
+	runtime->hw.rate_min = 48000;
+	runtime->hw.rate_max = 192000;
+	runtime->hw.channels_min = 2;
+	runtime->hw.channels_max = 2;
+	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
+	hinfo->maxbps = 32;
+	err = snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
+					 &list);
+	if (err < 0) {
+		hinfo->maxbps = spec->ae9_direct.maxbps;
+		ae9_direct_close_locked(spec, AE9_PCM_PLAYBACK);
+	}
+	return err;
+}
+
+static int ae9_playback_close(struct hda_pcm_stream *hinfo,
+			      struct hda_codec *codec, struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.caps_saved)
+		hinfo->maxbps = spec->ae9_direct.maxbps;
+	ae9_direct_close_locked(spec, AE9_PCM_PLAYBACK);
+	return 0;
+}
+
+static int ae9_wuh_open(struct hda_pcm_stream *hinfo,
+			struct hda_codec *codec, struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	return ae9_direct_open_locked(spec, AE9_PCM_WUH);
+}
+
+static int ae9_wuh_close(struct hda_pcm_stream *hinfo,
+			 struct hda_codec *codec, struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	ae9_direct_close_locked(spec, AE9_PCM_WUH);
+	return 0;
+}
+
 static void ae9_output_invalidate(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -4739,6 +4891,8 @@ static void ae9_output_invalidate(struct hda_codec *codec)
 		return;
 	guard(mutex)(&spec->ae9_output_mutex);
 	spec->ae9_output_applied = false;
+	spec->ae9_direct.valid = false;
+	spec->ae9_direct.dsp_pair_valid = false;
 	spec->ae9_acm_pending_mode = false;
 }
 
@@ -4752,8 +4906,22 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		scoped_guard(mutex, &spec->ae9_output_mutex) {
-			if (spec->dsp_state != DSP_DOWNLOADED ||
-			    !spec->ae9_output_applied)
+			int err;
+
+			if (spec->dsp_state != DSP_DOWNLOADED)
+				return -EIO;
+			if (spec->ae9_direct.enabled)
+				return ae9_direct_prepare_locked(codec,
+					substream->runtime->rate, stream_tag, format);
+			if (spec->ae9_direct.touched) {
+				err = ae9_direct_restore_locked(codec);
+				if (err < 0)
+					return err;
+				err = __ca0132_alt_select_out(codec);
+				if (err < 0)
+					return err;
+			}
+			if (!spec->ae9_output_applied)
 				return -EIO;
 			snd_hda_codec_setup_stream(codec, spec->dacs[0],
 						   stream_tag, 0, format);
@@ -4774,6 +4942,17 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 
 	if (spec->dsp_state == DSP_DOWNLOADING)
 		return 0;
+	/* The mode cannot change while this PCM is open. */
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    READ_ONCE(spec->ae9_direct.enabled)) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		int err = ae9_direct_mute(codec, true);
+
+		__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+		spec->ae9_direct.prepared = false;
+		spec->ae9_direct.valid = false;
+		return err;
+	}
 
 	/*If Playback effects are on, allow stream some time to flush
 	 *effects tail*/
@@ -4792,6 +4971,10 @@ static unsigned int ca0132_playback_pcm_delay(struct hda_pcm_stream *info,
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int latency = DSP_PLAYBACK_INIT_LATENCY;
 	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    READ_ONCE(spec->ae9_direct.enabled))
+		return 0;
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return 0;
@@ -5198,6 +5381,18 @@ static int equalizer_ctl_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
+static int ae9_equalizer_ctl_put(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
+	return equalizer_ctl_put(kcontrol, ucontrol);
+}
+
 static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(voice_focus_db_scale, 2000, 100, 0);
 static const SNDRV_CTL_TLVD_DECLARE_DB_SCALE(eq_db_scale, -2400, 100, 0);
 
@@ -5229,7 +5424,8 @@ static int add_tuning_control(struct hda_codec *codec,
 	case EQUALIZER:
 		knew.info = equalizer_ctl_info;
 		knew.get = tuning_ctl_get;
-		knew.put = equalizer_ctl_put;
+		knew.put = ca0132_quirk((struct ca0132_spec *)codec->spec) == QUIRK_AE9 ?
+			ae9_equalizer_ctl_put : equalizer_ctl_put;
 		knew.tlv.p = eq_db_scale;
 		break;
 	default:
@@ -5668,6 +5864,9 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	} else
 		spec->cur_out_type = spec->out_enum_val;
 	outfx_set = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
+
+	if (ca0132_quirk(spec) == QUIRK_AE9 && spec->ae9_direct.enabled)
+		return ae9_direct_output_locked(codec);
 
 	/* Begin DSP output switch, mute DSP volume. */
 	err = dspio_set_uint_param(codec, 0x96, SPEAKER_TUNING_MUTE, FLOAT_ONE);
@@ -6555,6 +6754,8 @@ static int ae9_outfx_switch_set(struct hda_codec *codec, hda_nid_t nid,
 	int err;
 
 	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
 	old = spec->effects_switch[nid - EFFECT_START_NID];
 	WRITE_ONCE(spec->effects_switch[nid - EFFECT_START_NID], value);
 	if (nid == PLAY_ENHANCEMENT)
@@ -6872,6 +7073,8 @@ static int ae9_fx_slider_put(struct hda_codec *codec, hda_nid_t nid,
 		return pm.err;
 
 	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
 	if (*cur_val == value)
 		return 0;
 
@@ -7437,6 +7640,8 @@ static int ca0132_alt_speaker_channel_cfg_put(struct snd_kcontrol *kcontrol,
 			return err;
 		}
 		guard(mutex)(&spec->ae9_output_mutex);
+		if (spec->ae9_direct.enabled)
+			return -EBUSY;
 		old = spec->channel_cfg_val;
 		if (old == sel && spec->ae9_output_applied)
 			return 0;
@@ -7523,6 +7728,18 @@ static int ca0132_alt_svm_setting_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
+static int ae9_svm_setting_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
+	return ca0132_alt_svm_setting_put(kcontrol, ucontrol);
+}
+
 /* EQ preset controls for alternative CA0132 controls. */
 static int ca0132_alt_eq_preset_info(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_info *uinfo)
@@ -7579,6 +7796,18 @@ static int ca0132_alt_eq_preset_put(struct snd_kcontrol *kcontrol,
 		spec->eq_preset_val = sel;
 
 	return 1;
+}
+
+static int ae9_eq_preset_put(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
+	return ca0132_alt_eq_preset_put(kcontrol, ucontrol);
 }
 
 static int ca0132_voicefx_info(struct snd_kcontrol *kcontrol,
@@ -7723,6 +7952,8 @@ static int ae9_speaker_switch_put(struct hda_codec *codec, hda_nid_t nid,
 	if (value != 0 && value != 1)
 		return -EINVAL;
 	guard(mutex)(&spec->ae9_output_mutex);
+	if (spec->ae9_direct.enabled)
+		return -EBUSY;
 	if (nid == BASS_REDIRECTION)
 		cache = &spec->bass_redirection_val;
 	else
@@ -7897,9 +8128,11 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	if (pm.err < 0)
 		return pm.err;
 	guard(mutex)(&codec->control_mutex);
-	err = ae9_dsp_volume_unity(codec);
-	if (err < 0)
-		return err;
+	if (!READ_ONCE(spec->ae9_direct.enabled)) {
+		err = ae9_dsp_volume_unity(codec);
+		if (err < 0)
+			return err;
+	}
 	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
 	/* A failed stereo put may already have changed one channel. */
 	ae9_acm_display_changed(spec);
@@ -8304,7 +8537,8 @@ static int add_ca0132_alt_eq_presets(struct hda_codec *codec)
 				    EQ_PRESET_ENUM, 1, 0, HDA_OUTPUT);
 	knew.info = ca0132_alt_eq_preset_info;
 	knew.get = ca0132_alt_eq_preset_get;
-	knew.put = ca0132_alt_eq_preset_put;
+	knew.put = ca0132_quirk((struct ca0132_spec *)codec->spec) == QUIRK_AE9 ?
+		ae9_eq_preset_put : ca0132_alt_eq_preset_put;
 	return snd_hda_ctl_add(codec, EQ_PRESET_ENUM,
 				snd_ctl_new1(&knew, codec));
 }
@@ -8321,7 +8555,8 @@ static int ca0132_alt_add_svm_enum(struct hda_codec *codec)
 				    SMART_VOLUME_ENUM, 1, 0, HDA_OUTPUT);
 	knew.info = ca0132_alt_svm_setting_info;
 	knew.get = ca0132_alt_svm_setting_get;
-	knew.put = ca0132_alt_svm_setting_put;
+	knew.put = ca0132_quirk((struct ca0132_spec *)codec->spec) == QUIRK_AE9 ?
+		ae9_svm_setting_put : ca0132_alt_svm_setting_put;
 	return snd_hda_ctl_add(codec, SMART_VOLUME_ENUM,
 				snd_ctl_new1(&knew, codec));
 
@@ -9075,11 +9310,23 @@ static int ae9_voice_capture_open(struct hda_pcm_stream *hinfo,
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	guard(mutex)(&spec->ae9_voice.mutex);
-	if (ae9_voice_wanted(&spec->ae9_voice.desired, spec->in_enum_val))
-		return snd_pcm_hw_constraint_single(substream->runtime,
-					SNDRV_PCM_HW_PARAM_RATE, 48000);
-	return 0;
+	int err;
+
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		err = ae9_direct_open_locked(spec, AE9_PCM_MIC);
+		if (err < 0)
+			return err;
+	}
+	scoped_guard(mutex, &spec->ae9_voice.mutex) {
+		if (ae9_voice_wanted(&spec->ae9_voice.desired, spec->in_enum_val))
+			err = snd_pcm_hw_constraint_single(substream->runtime,
+							   SNDRV_PCM_HW_PARAM_RATE, 48000);
+	}
+	if (err < 0) {
+		guard(mutex)(&spec->ae9_output_mutex);
+		ae9_direct_close_locked(spec, AE9_PCM_MIC);
+	}
+	return err;
 }
 
 static int ae9_voice_cleanup_locked(struct hda_pcm_stream *hinfo,
@@ -9224,6 +9471,17 @@ static int ae9_voice_capture_cleanup(struct hda_pcm_stream *hinfo,
 		return pm.err;
 	}
 	return ae9_voice_cleanup_locked(hinfo, codec);
+}
+
+static int ae9_voice_capture_close(struct hda_pcm_stream *hinfo,
+				   struct hda_codec *codec, struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err = ae9_voice_capture_cleanup(hinfo, codec, substream);
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	ae9_direct_close_locked(spec, AE9_PCM_MIC);
+	return err;
 }
 
 static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source)
@@ -9521,6 +9779,115 @@ static const struct snd_kcontrol_new ae9_voice_controls[] = {
 #undef AE9_VOICE_CTL
 /* AE9_VOICE_END */
 
+static bool ae9_direct_effect_control(struct snd_kcontrol *kctl)
+{
+	hda_nid_t nid;
+
+#ifdef ENABLE_TUNING_CONTROLS
+	if (kctl->put == ae9_equalizer_ctl_put)
+		return true;
+#endif
+	if (kctl->put == ae9_eq_preset_put ||
+	    kctl->put == ae9_svm_setting_put ||
+	    kctl->put == ca0132_alt_effect_slider_put ||
+	    kctl->put == ca0132_alt_xbass_xover_slider_put ||
+	    kctl->put == ca0132_alt_speaker_channel_cfg_put)
+		return true;
+	if (kctl->put != ca0132_switch_put)
+		return false;
+	nid = get_amp_nid(kctl);
+	return nid == PLAY_ENHANCEMENT ||
+		(nid >= OUT_EFFECT_START_NID && nid < OUT_EFFECT_END_NID) ||
+		nid == SPEAKER_FULL_RANGE_FRONT || nid == SPEAKER_FULL_RANGE_REAR ||
+		nid == BASS_REDIRECTION;
+}
+
+/* Called only from a put callback, with ALSA's controls_rwsem held. */
+static void ae9_direct_controls(struct hda_codec *codec, bool active)
+{
+	struct snd_kcontrol *kctl;
+
+	list_for_each_entry(kctl, &codec->card->controls, list) {
+		if (snd_kcontrol_chip(kctl) != codec ||
+		    !ae9_direct_effect_control(kctl))
+			continue;
+		if (active)
+			kctl->vd[0].access &= ~SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+		else
+			kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_INFO, &kctl->id);
+	}
+}
+
+static int ae9_direct_get(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->ae9_output_mutex);
+	ucontrol->value.integer.value[0] = spec->ae9_direct.enabled;
+	return 0;
+}
+
+static int ae9_direct_put(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	long value = ucontrol->value.integer.value[0];
+	int err;
+
+	if (value != 0 && value != 1)
+		return -EINVAL;
+	CLASS(snd_hda_power_pm, pm)(codec);
+	err = ae9_pm_error(codec, pm.err);
+	if (err < 0)
+		return err;
+	guard(mutex)(&spec->ae9_output_mutex);
+	if (value == spec->ae9_direct.enabled)
+		return 0;
+	if (spec->ae9_direct.opened) {
+		codec_info(codec, "AE-9: Direct change busy, open mask=0x%x\n",
+			   spec->ae9_direct.opened);
+		return -EBUSY;
+	}
+	if (!value && spec->ae9_direct.touched) {
+		err = ae9_direct_restore_locked(codec);
+		if (err < 0)
+			goto fail;
+	}
+	err = ae9_direct_set_locked(spec, value);
+	if (err <= 0)
+		return err;
+	if (!value) {
+		err = __ca0132_alt_select_out(codec);
+		if (err < 0) {
+			spec->ae9_direct.enabled = true;
+			goto fail;
+		}
+	}
+	ae9_direct_controls(codec, !value);
+	WRITE_ONCE(spec->ae9_acm_pending_fx, true);
+	return 1;
+fail:
+	spec->ae9_direct.valid = false;
+	spec->ae9_output_applied = false;
+	spec->ae9_acm_pending_mode = false;
+	return err;
+}
+
+static const struct snd_kcontrol_new ae9_direct_controls_new[] = {
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "AE-9: Direct Mode Switch",
+		.info = snd_ctl_boolean_mono_info,
+		.get = ae9_direct_get,
+		.put = ae9_direct_put,
+	},
+	{ }
+};
+
 static int ca0132_build_controls(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -9703,6 +10070,9 @@ static int ca0132_build_controls(struct hda_codec *codec)
 #endif
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = snd_hda_add_new_ctls(codec, ae9_direct_controls_new);
+		if (err < 0)
+			return err;
 		err = ae9_add_acm_mic_jack(codec);
 		if (err < 0)
 			return err;
@@ -9787,7 +10157,7 @@ static const struct hda_pcm_stream ae9_pcm_analog_capture = {
 	.channels_max = 2,
 	.ops = {
 		.open = ae9_voice_capture_open,
-		.close = ae9_voice_capture_cleanup,
+		.close = ae9_voice_capture_close,
 		.prepare = ae9_voice_capture_prepare,
 		.cleanup = ae9_voice_capture_cleanup,
 		.get_delay = ca0132_capture_pcm_delay,
@@ -9865,6 +10235,10 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 	}
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK] = ca0132_pcm_analog_playback;
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dacs[0];
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK].ops.open = ae9_playback_open;
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK].ops.close = ae9_playback_close;
+	}
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].channels_max =
 		spec->multiout.max_channels;
 	if (ae9_capture_blocked(codec)) {
@@ -9894,6 +10268,10 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 	info->stream[SNDRV_PCM_STREAM_CAPTURE] = ca0132_pcm_analog_capture;
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].substreams = 1;
 	info->stream[SNDRV_PCM_STREAM_CAPTURE].nid = spec->adcs[2];
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		info->stream[SNDRV_PCM_STREAM_CAPTURE].ops.open = ae9_wuh_open;
+		info->stream[SNDRV_PCM_STREAM_CAPTURE].ops.close = ae9_wuh_close;
+	}
 
 digital:
 	return ca0132_build_digital_pcm(codec);
@@ -10939,6 +11317,712 @@ static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned in
 		(spec->ae9_dac_reg7 & AE9_DAC_FILTER_MASK);
 	ca0113_mmio_command_set(codec, 0x48, reg, val);
 	spec->ae9_dac_reg7 = val;
+}
+
+/*
+ * Direct routing: 3xHelix 9a661afe5298, adapted to the HDA codec API.
+ * Keep the firmware and microphone streams running.
+ */
+static int ae9_direct_read(struct hda_codec *codec, u32 addr, u32 *value)
+{
+	u32 previous = 0, sample;
+	int i, err;
+
+	for (i = 0; i < 6; i++) {
+		err = chipio_read(codec, addr, &sample);
+		if (err < 0)
+			return err;
+		if (sample == ~0U || sample == 0x0bad0add) {
+			codec_err(codec, "AE-9: Direct read %06x invalid %08x\n",
+				  addr, sample);
+			return -EIO;
+		}
+		if (i && sample == previous) {
+			*value = sample;
+			return 0;
+		}
+		previous = sample;
+	}
+	codec_err(codec, "AE-9: Direct read %06x unstable, last %08x\n",
+		  addr, sample);
+	return -EIO;
+}
+
+static int ae9_direct_xram(struct hda_codec *codec, u16 addr)
+{
+	struct ca0132_spec *spec = codec->spec;
+	u32 value, previous = ~0U;
+	int i, err;
+
+	guard(mutex)(&spec->chipio_mutex);
+	for (i = 0; i < 6; i++) {
+		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+					  VENDOR_CHIPIO_8051_ADDRESS_LOW, addr & 0xff);
+		if (err < 0)
+			return err;
+		err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+					  VENDOR_CHIPIO_8051_ADDRESS_HIGH, addr >> 8);
+		if (err < 0)
+			return err;
+		err = snd_hdac_read(&codec->core, WIDGET_CHIP_CTRL,
+				    VENDOR_CHIPIO_8051_DATA_READ, 0, &value);
+		if (err < 0)
+			return err;
+		if (value > 0xff) {
+			codec_err(codec, "AE-9: Direct XRAM %04x invalid %08x\n",
+				  addr, value);
+			return -EIO;
+		}
+		if (value == previous)
+			return value;
+		previous = value;
+	}
+	codec_err(codec, "AE-9: Direct XRAM %04x unstable, last %08x\n",
+		  addr, value);
+	return -EIO;
+}
+
+/* Validate the complete allocation before writing any router entry. */
+static int ae9_direct_collect(struct hda_codec *codec, unsigned int count,
+			      u8 *slots, u32 *values)
+{
+	unsigned int i, j;
+	int slot, err;
+
+	if (count != 2 && count != 4 && count != AE9_DIRECT_MAX_SLOTS)
+		return -EINVAL;
+	slot = ae9_direct_xram(codec, 0x157d);
+	for (i = 0; i < count; i++) {
+		if (slot < 0)
+			return slot;
+		if (slot < 0x0c || slot >= AE9_DIRECT_ROUTER_ENTRIES) {
+			codec_err(codec, "AE-9: Direct chain index=%u count=%u slot=%d\n",
+				  i, count, slot);
+			return -EIO;
+		}
+		for (j = 0; j < i; j++)
+			if (slots[j] == slot)
+				return -EIO;
+		slots[i] = slot;
+		err = ae9_direct_read(codec, 0x190000 + 4 * slot, &values[i]);
+		if (err < 0)
+			return err;
+		if ((values[i] >> 18) || ((values[i] >> 16) & 3) != 1 ||
+		    (values[i] & 0xff) != i) {
+			codec_err(codec, "AE-9: Direct chain index=%u slot=%d value=%08x\n",
+				  i, slot, values[i]);
+			return -EIO;
+		}
+		slot = ae9_direct_xram(codec, 0x1478 + slot);
+	}
+	return slot < 0 ? slot : slot == 0xff ? 0 : -EIO;
+}
+
+static int ae9_direct_wait(struct hda_codec *codec)
+{
+	u32 depth;
+	int i, err;
+
+	for (i = 0; i < 100; i++) {
+		err = snd_hdac_read(&codec->core, WIDGET_CHIP_CTRL,
+				    AE9_8051_QUEUE_DEPTH, 0, &depth);
+		if (err < 0)
+			return err;
+		if (depth > 0xff) {
+			codec_err(codec, "AE-9: Direct queue invalid %08x\n", depth);
+			return -EIO;
+		}
+		if (!depth)
+			return 0;
+		usleep_range(1000, 1500);
+	}
+	return -ETIMEDOUT;
+}
+
+static int ae9_direct_param(struct hda_codec *codec, unsigned int id,
+			    unsigned int value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	guard(mutex)(&spec->chipio_mutex);
+	/* Status also precedes compact stream commands in the capture. */
+	err = chipio_send(codec, VENDOR_CHIPIO_STATUS, 0);
+	if (err < 0) {
+		codec_err(codec, "AE-9: Direct status failed before param %02x=%02x: %d\n",
+			  id, value, err);
+		return err;
+	}
+	err = ae9_voice_param_locked(codec, id, value);
+	if (err < 0)
+		codec_err(codec, "AE-9: Direct param %02x=%02x failed: %d\n",
+			  id, value, err);
+	return err;
+}
+
+static int ae9_direct_stream(struct hda_codec *codec, u8 id, bool on)
+{
+	int err;
+
+	err = ae9_direct_param(codec, CONTROL_PARAM_STREAM_ID, id);
+	if (err < 0)
+		return err;
+	err = ae9_direct_param(codec, CONTROL_PARAM_STREAM_CONTROL, on);
+	if (err < 0)
+		return err;
+	msleep(on ? 75 : 50);
+	return ae9_direct_wait(codec);
+}
+
+static int ae9_direct_drain(struct hda_codec *codec, u8 id)
+{
+	int refs, err, i;
+
+	for (i = 0; i <= 8; i++) {
+		refs = ae9_direct_xram(codec, 0x0734 + 10 * id);
+		if (refs < 0)
+			return refs;
+		if (!refs)
+			return 0;
+		if (refs > 8 || i == 8) {
+			codec_err(codec, "AE-9: Direct drain stream %02x refs=%d\n",
+				  id, refs);
+			return -EIO;
+		}
+		err = ae9_direct_stream(codec, id, false);
+		if (err < 0)
+			return err;
+	}
+	return -EIO;
+}
+
+static int ae9_direct_pll(struct hda_codec *codec, u8 reg, u8 value)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	guard(mutex)(&spec->chipio_mutex);
+	err = snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+				  VENDOR_CHIPIO_8051_ADDRESS_LOW, reg);
+	if (err < 0)
+		return err;
+	return snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+				   VENDOR_CHIPIO_PLL_PMU_WRITE, value);
+}
+
+static int ae9_direct_clock(struct hda_codec *codec,
+			    const struct ae9_direct_rate *rate)
+{
+	static const u8 regs[] = { 0x40, 0x42, 0x41 };
+	static const u8 vals[] = { 0xc7, 0xcd, 0xce };
+	int i, err;
+
+	err = ae9_direct_param(codec, CONTROL_PARAM_ASI, 8);
+	if (err < 0)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		err = ae9_direct_pll(codec, regs[i], vals[i]);
+		if (err < 0)
+			return err;
+	}
+	for (i = 0; i < 3; i++) {
+		err = chipio_write(codec, 0x189000 + 4 * i, rate->clock);
+		if (err < 0)
+			return err;
+	}
+	err = chipio_write(codec, 0x189024, rate->divisor);
+	if (err < 0)
+		return err;
+	return chipio_write(codec, 0x189028, 0x0002000f);
+}
+
+static int ae9_direct_mute(struct hda_codec *codec, bool mute)
+{
+	struct ca0132_spec *spec = codec->spec;
+	u8 value;
+
+	guard(mutex)(&spec->ae9_dac_mutex);
+	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U)
+		return -ENODEV;
+	value = (spec->ae9_dac_reg7 & ~1) | mute;
+	/* No DAC acknowledgment: this remains a command cache. */
+	ca0113_mmio_command_set(codec, 0x48, 0x07, value);
+	spec->ae9_dac_reg7 = value;
+	return 0;
+}
+
+static int ae9_direct_unbind(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	u32 value;
+	int err;
+
+	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+	err = snd_hdac_read(&codec->core, spec->dacs[0],
+			    AC_VERB_GET_CONV, 0, &value);
+	if (err < 0)
+		return err;
+	if (value) {
+		codec_err(codec, "AE-9: Direct unbind converter=%08x\n", value);
+		return -EIO;
+	}
+	return ae9_direct_wait(codec);
+}
+
+static int ae9_direct_bind(struct hda_codec *codec, unsigned int tag,
+			   unsigned int format)
+{
+	struct ca0132_spec *spec = codec->spec;
+	u32 value;
+	int err;
+
+	snd_hda_codec_setup_stream(codec, spec->dacs[0], tag, 0, format);
+	err = snd_hdac_read(&codec->core, spec->dacs[0],
+			    AC_VERB_GET_STREAM_FORMAT, 0, &value);
+	if (err < 0)
+		return err;
+	if (value != format) {
+		codec_err(codec, "AE-9: Direct format got %08x expected %04x\n",
+			  value, format);
+		return -EIO;
+	}
+	err = snd_hdac_read(&codec->core, spec->dacs[0],
+			    AC_VERB_GET_CONV, 0, &value);
+	if (err < 0)
+		return err;
+	if (value != tag << 4) {
+		codec_err(codec, "AE-9: Direct converter got %08x expected %02x\n",
+			  value, tag << 4);
+		return -EIO;
+	}
+	return ae9_direct_wait(codec);
+}
+
+static int ae9_direct_stream_setup(struct hda_codec *codec, u8 id,
+				   u8 source, u8 dest, u8 channels)
+{
+	static const u8 ids[] = {
+		CONTROL_PARAM_STREAM_ID, CONTROL_PARAM_STREAM_SOURCE_CONN_POINT,
+		CONTROL_PARAM_STREAM_DEST_CONN_POINT, CONTROL_PARAM_STREAMS_CHANNELS,
+	};
+	const u8 values[] = { id, source, dest, channels };
+	int i, err;
+
+	for (i = 0; i < ARRAY_SIZE(ids); i++) {
+		err = ae9_direct_param(codec, ids[i], values[i]);
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}
+
+/* Remember observed DSP slots only while their 0x0c allocation survives. */
+static int ae9_direct_dsp_pair(struct hda_codec *codec, const u32 *entries,
+			       u8 *slots)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	int front[2] = { -1, -1 }, fallback[2] = { -1, -1 };
+	int i, channel, refs;
+
+	refs = ae9_direct_xram(codec, 0x0734 + 10 * 0x0c);
+	if (refs < 0)
+		return refs;
+	if (!refs || refs > 8) {
+		codec_err(codec, "AE-9: Direct DSP allocation refs=%d\n", refs);
+		direct->dsp_pair_valid = false;
+		return -EIO;
+	}
+	for (i = 0; i < AE9_DIRECT_ROUTER_ENTRIES; i++) {
+		u32 value = entries[i];
+		u8 src = value, dst = value >> 8;
+
+		if (value >> 18)
+			return -EIO;
+		if (src < 0xc0 || src >= 0xe0 || !(value & 0x30000))
+			continue;
+		if (dst == 0x40 || dst == 0x41) {
+			channel = dst - 0x40;
+			if (front[channel] >= 0)
+				return -EIO;
+			front[channel] = i;
+		}
+		if (dst == 0xe0 || dst == 0xe1) {
+			channel = dst - 0xe0;
+			if (fallback[channel] >= 0)
+				return -EIO;
+			fallback[channel] = i;
+		}
+	}
+	if (front[0] < 0 || front[1] < 0) {
+		front[0] = fallback[0];
+		front[1] = fallback[1];
+	}
+	if (front[0] < 0 || front[1] < 0) {
+		if (!direct->dsp_pair_valid) {
+			codec_err(codec,
+				  "AE-9: Direct DSP pair missing: front=%d/%d fallback=%d/%d refs=%d\n",
+				  front[0], front[1], fallback[0], fallback[1], refs);
+			return -EIO;
+		}
+		for (i = 0; i < 2; i++) {
+			u8 slot = direct->dsp_slots[i];
+			u32 value;
+			u8 dst;
+
+			if (slot < 0x0c || slot >= AE9_DIRECT_ROUTER_ENTRIES)
+				return -EIO;
+			value = entries[slot];
+			dst = value >> 8;
+			if ((value & 0xff) != direct->dsp_sources[i] ||
+			    (dst != 0x40 + i && dst != 0xe0 + i) ||
+			    ((value >> 16) & 3) > 1)
+				return -EIO;
+			front[i] = slot;
+		}
+	}
+	if ((entries[front[0]] & 0xff) == (entries[front[1]] & 0xff))
+		return -EIO;
+	/* Save before writes so a failed partial transition can be retried. */
+	for (i = 0; i < 2; i++) {
+		slots[i] = front[i];
+		direct->dsp_slots[i] = front[i];
+		direct->dsp_sources[i] = entries[front[i]];
+	}
+	direct->dsp_pair_valid = true;
+	return 0;
+}
+
+/* Remove playback DSP feeds, never DSP-to-HDA microphone/capture routes. */
+static int ae9_direct_sweep(struct hda_codec *codec)
+{
+	u32 entries[AE9_DIRECT_ROUTER_ENTRIES];
+	u8 slots[2];
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		err = ae9_direct_read(codec, 0x190000 + 4 * i, &entries[i]);
+		if (err < 0)
+			return err;
+		if (entries[i] >> 18) {
+			codec_err(codec, "AE-9: Direct router slot %d invalid %08x\n",
+				  i, entries[i]);
+			return -EIO;
+		}
+	}
+	err = ae9_direct_dsp_pair(codec, entries, slots);
+	if (err < 0)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		u32 v = entries[i];
+		u8 src = v, dst = v >> 8;
+
+		if (!(v & 0x30000))
+			continue;
+		if (!((src >= 0xc0 && src < 0xe0 && dst >= 0x40 && dst < 0x80) ||
+		      (src < 0x20 && dst >= 0x80 && dst < 0xc0)))
+			continue;
+		err = chipio_write(codec, 0x190000 + 4 * i, v & 0xffff);
+		if (err < 0)
+			return err;
+	}
+	return chipio_write(codec, 0x19042c, 1);
+}
+
+static int ae9_direct_program(struct hda_codec *codec,
+			      const struct ae9_direct_rate *rate, unsigned int tag,
+			      unsigned int format)
+{
+	struct ca0132_spec *spec = codec->spec;
+	u8 slots[AE9_DIRECT_MAX_SLOTS];
+	u32 values[AE9_DIRECT_MAX_SLOTS];
+	int i, err;
+
+	spec->ae9_direct.stage = "route:1:ae9_direct_unbind";
+	err = ae9_direct_unbind(codec);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:2:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x14);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:3:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x18);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:4:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x05);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:5:ae9_direct_sweep";
+	err = ae9_direct_sweep(codec);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:6:chipio_write";
+	err = chipio_write(codec, 0x18b008, 0xf0);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:7:ae9_direct_stream_setup";
+	err = ae9_direct_stream_setup(codec, 0x05, 0x43, 0xd0, 2);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:8:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_ID, 0xd0);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:9:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_SAMPLE_RATE,
+			       rate->code);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:10:ae9_direct_stream_setup";
+	err = ae9_direct_stream_setup(codec, 0x14, 0x43, 0, 2);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:11:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_ID, 0);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:12:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_SAMPLE_RATE,
+			       SR_96_000);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:13:ae9_direct_param";
+	err = ae9_direct_param(codec, 0x0d,
+			       spec->cur_out_type == HEADPHONE_OUT ? 0xa1 : 0xa4);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:14:ae9_direct_bind";
+	err = ae9_direct_bind(codec, tag, format);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:15:ae9_direct_clock";
+	err = ae9_direct_clock(codec, rate);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:16:ae9_direct_collect";
+	err = ae9_direct_collect(codec, rate->slots, slots, values);
+	if (err < 0)
+		return err;
+	for (i = 0; i < rate->slots; i++) {
+		err = chipio_write(codec, 0x190000 + 4 * slots[i],
+				   (values[i] & 0xfffd00ff) | ((0x40 + i) << 8));
+		if (err < 0)
+			return err;
+	}
+	spec->ae9_direct.stage = "route:17:chipio_write";
+	err = chipio_write(codec, 0x19042c, 1);
+	if (err < 0)
+		return err;
+	spec->ae9_direct.stage = "route:18:ae9_direct_stream";
+	err = ae9_direct_stream(codec, 0x14, true);
+	if (err < 0)
+		return err;
+	return ae9_direct_param(codec, CONTROL_PARAM_ASI, 0x0f);
+}
+
+/* Caller owns output_mutex; serialize clock changes with voice preparation. */
+static int ae9_direct_prepare_locked(struct hda_codec *codec,
+				     unsigned int rate, unsigned int tag, unsigned int format)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	const struct ae9_direct_rate *params = ae9_direct_rate(rate);
+	unsigned int expected;
+	bool muted;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (!params || !tag || tag > 15)
+		return -EINVAL;
+	expected = rate == 48000 ? 0x0041 : rate == 96000 ? 0x0841 : 0x1841;
+	if (format != expected)
+		return -EINVAL;
+	guard(mutex)(&spec->ae9_voice.mutex);
+	direct->valid = false;
+	direct->prepared = false;
+	if (!direct->touched) {
+		guard(mutex)(&spec->ae9_dac_mutex);
+		direct->saved_mute = spec->ae9_dac_reg7 & 1;
+	}
+	direct->touched = true;
+	muted = direct->saved_mute;
+	spec->ae9_direct.stage = "prepare:1:ae9_direct_mute";
+	err = ae9_direct_mute(codec, true);
+	if (err < 0)
+		goto fail;
+	ae9_dac_write(codec, 0x01, 0xc0);
+	ae9_dac_write(codec, 0x0a, 0x02);
+	spec->ae9_direct.stage = "prepare:2:ae9_direct_program";
+	err = ae9_direct_program(codec, params, tag, format);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "prepare:3:ae9_direct_output_locked";
+	err = ae9_direct_output_locked(codec);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "prepare:4:ae9_direct_mute";
+	err = ae9_direct_mute(codec, muted);
+	if (err < 0)
+		goto fail;
+	direct->rate = rate;
+	direct->valid = true;
+	direct->prepared = true;
+	return 0;
+fail:
+	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+	spec->ae9_output_applied = false;
+	spec->ae9_acm_pending_mode = false;
+	codec_err(codec, "AE-9: Direct prepare failed at %s: %d\n",
+		  direct->stage, err);
+	return err;
+}
+
+/* Reuse allocated DSP output slots; never guess DSP port numbers or free slots. */
+static int ae9_direct_front_dsp(struct hda_codec *codec)
+{
+	u32 entries[AE9_DIRECT_ROUTER_ENTRIES], value;
+	u8 front[2];
+	int i, channel, err;
+
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		err = ae9_direct_read(codec, 0x190000 + 4 * i, &entries[i]);
+		if (err < 0)
+			return err;
+		if (entries[i] >> 18) {
+			codec_err(codec, "AE-9: Direct router slot %d invalid %08x\n",
+				  i, entries[i]);
+			return -EIO;
+		}
+	}
+	err = ae9_direct_dsp_pair(codec, entries, front);
+	if (err < 0)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		u8 src = entries[i], dst = entries[i] >> 8;
+
+		value = entries[i];
+		if (i == front[0] || i == front[1]) {
+			channel = i == front[1];
+			value = 0x10000 | ((0x40 + channel) << 8) | src;
+		} else if ((value & 0x30000) && src < 0x20 &&
+			   dst >= 0x40 && dst < 0x48) {
+			value &= 0xffff;
+		}
+		if (value == entries[i])
+			continue;
+		err = chipio_write(codec, 0x190000 + 4 * i, value);
+		if (err < 0)
+			return err;
+		entries[i] = value;
+	}
+	err = chipio_write(codec, 0x19042c, 1);
+	if (err < 0)
+		return err;
+	for (i = 0; i < 2; i++) {
+		err = ae9_direct_read(codec, 0x190000 + 4 * front[i], &value);
+		if (err < 0)
+			return err;
+		if (value != entries[front[i]])
+			return -EIO;
+	}
+	return 0;
+}
+
+static int ae9_direct_restore_locked(struct hda_codec *codec)
+{
+	static const u8 regs[] = { 0x44, 0x43, 0x45, 0x40, 0x42, 0x41, 0x51 };
+	static const u8 vals[] = { 0xc8, 0xcc, 0xcb, 0xc7, 0xcd, 0xce, 0xdb };
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	int i, err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	guard(mutex)(&spec->ae9_voice.mutex);
+	direct->valid = false;
+	direct->prepared = false;
+	spec->ae9_direct.stage = "restore:1:ae9_direct_mute";
+	err = ae9_direct_mute(codec, true);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:2:ae9_direct_unbind";
+	err = ae9_direct_unbind(codec);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:3:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x05);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:4:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x14);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:5:ae9_direct_drain";
+	err = ae9_direct_drain(codec, 0x18);
+	if (err < 0)
+		goto fail;
+	/* Keep 0x0c and its DMA allocation; the microphone may use the DSP. */
+	spec->ae9_direct.stage = "restore:6:ae9_direct_stream_setup";
+	err = ae9_direct_stream_setup(codec, 0x05, 0x43, 0, 2);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:7:ae9_direct_stream_setup";
+	err = ae9_direct_stream_setup(codec, 0x18, 0x09, 0xd0, 6);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:8:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_ID, 0xd0);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:9:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_CONN_POINT_SAMPLE_RATE,
+			       SR_96_000);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:10:ae9_direct_stream";
+	err = ae9_direct_stream(codec, 0x18, true);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:11:ae9_direct_clock";
+	err = ae9_direct_clock(codec, ae9_direct_rate(96000));
+	if (err < 0)
+		goto fail;
+	ae9_dac_write(codec, 0x01, 0xc0);
+	ae9_dac_write(codec, 0x0a, 0x02);
+	msleep(20);
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		err = ae9_direct_pll(codec, regs[i], vals[i]);
+		if (err < 0)
+			goto fail;
+	}
+	spec->ae9_direct.stage = "restore:12:ae9_direct_param";
+	err = ae9_direct_param(codec, CONTROL_PARAM_ASI, 0x0f);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:13:ae9_direct_wait";
+	err = ae9_direct_wait(codec);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:14:ae9_direct_front_dsp";
+	err = ae9_direct_front_dsp(codec);
+	if (err < 0)
+		goto fail;
+	spec->ae9_direct.stage = "restore:15:ae9_direct_mute";
+	err = ae9_direct_mute(codec, direct->saved_mute);
+	if (err < 0)
+		goto fail;
+	direct->touched = false;
+	direct->rate = 96000;
+	return 0;
+fail:
+	codec_err(codec, "AE-9: DSP restore failed at %s: %d\n",
+		  direct->stage, err);
+	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+	spec->ae9_output_applied = false;
+	spec->ae9_acm_pending_mode = false;
+	return err;
 }
 
 /* Enable THD logic with zero coefficients, as captured. */
@@ -12331,7 +13415,8 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 
 static bool ae9_fx_enabled(struct ca0132_spec *spec)
 {
-	return spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] != 0;
+	return !spec->ae9_direct.enabled &&
+		spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] != 0;
 }
 
 /* The service worker consumes the LED request with its committed cache. */
@@ -12359,6 +13444,8 @@ static void ae9_acm_apply_sbx_press(struct hda_codec *codec, int ms)
 		return;
 	}
 	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		if (spec->ae9_direct.enabled)
+			return;
 		old = ae9_fx_enabled(spec);
 		WRITE_ONCE(spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID],
 			   !old);
@@ -12502,6 +13589,48 @@ static void ae9_acm_service_knob_press(struct hda_codec *codec)
  * ACM reg2 bit6 controls the headphone amp separately; leave device
  * 0x49 at its bring-up state.
  */
+static int ae9_direct_output_locked(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	bool hp = spec->cur_out_type == HEADPHONE_OUT;
+	bool restore = spec->ae9_direct.valid, muted = true;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (restore) {
+		scoped_guard(mutex, &spec->ae9_dac_mutex)
+			muted = spec->ae9_dac_reg7 & 1;
+		err = ae9_direct_mute(codec, true);
+		if (err < 0)
+			goto fail;
+	}
+	err = snd_hda_codec_write(codec, spec->out_pins[0], 0,
+				  AC_VERB_SET_EAPD_BTLENABLE, !hp);
+	if (err < 0)
+		goto fail;
+	err = ca0132_set_out_node_pincfg(codec, spec->out_pins[0], !hp, 0);
+	if (err < 0)
+		goto fail;
+	err = ca0132_set_out_node_pincfg(codec, 0x10, hp, hp);
+	if (err < 0)
+		goto fail;
+	if (ae9_out_mute)
+		ae9_dac_write(codec, 0x1d, hp ? 0x80 : 0x40);
+	if (restore) {
+		err = ae9_direct_mute(codec, muted);
+		if (err < 0)
+			goto fail;
+	}
+	spec->ae9_output_applied = true;
+	spec->ae9_acm_pending_mode = true;
+	return 0;
+fail:
+	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
+	spec->ae9_direct.valid = false;
+	spec->ae9_output_applied = false;
+	return err;
+}
+
 static void ae9_apply_output_path(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -12510,6 +13639,8 @@ static void ae9_apply_output_path(struct hda_codec *codec)
 	if (ca0132_quirk(spec) != QUIRK_AE9)
 		return;
 	if (!ae9_out_mute)
+		return;
+	if (spec->ae9_direct.enabled)
 		return;
 
 	ae9_dac_write(codec, 0x07, 0x80);		/* ES9038 unmuted */
@@ -13025,6 +14156,11 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	int idx, i, err;
 	const char *stage = "master-control/overlay";
 
+	spec->ae9_direct.touched = false;
+	spec->ae9_direct.prepared = false;
+	spec->ae9_direct.valid = false;
+	spec->ae9_direct.dsp_pair_valid = false;
+	spec->ae9_direct.rate = 0;
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return -EIO;
 
@@ -15091,7 +16227,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.2.0-preview26-acm-comments1");
+MODULE_VERSION("0.2.0-preview28-direct-diag1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
