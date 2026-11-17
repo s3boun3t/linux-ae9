@@ -28,6 +28,8 @@
 #include <linux/xarray.h>
 #include <linux/refcount.h>
 #include <linux/completion.h>
+#include <linux/atomic.h>
+#include <linux/wait.h>
 
 #include <asm/io.h>
 #include <sound/core.h>
@@ -822,6 +824,16 @@ static const struct ae_ca0113_output_set ae7_ca0113_output_presets = {
 		    { 0x3f, 0x3f, 0x00, 0x00, 0x02, 0x00 } },
 };
 
+/* AE-9 front DAC THD settings. Keep the existing group 0x30 writes. */
+static const struct ae_ca0113_output_set ae9_ca0113_output_presets = {
+	.group  = { 0x30, 0x30, 0x48, 0x48, 0x48, 0x30 },
+	.target = { 0x2e, 0x30, 0x0d, 0x17, 0x19, 0x32 },
+	.vals = {
+		[SPEAKER_OUT]   = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f },
+		[HEADPHONE_OUT] = { 0x3f, 0x3f, 0x00, 0x00, 0x01, 0x00 },
+	},
+};
+
 /* ae5 ca0113 command sequences to set headphone gain levels. */
 #define AE5_HEADPHONE_GAIN_PRESET_MAX_COMMANDS 4
 struct ae5_headphone_gain_set {
@@ -1159,6 +1171,8 @@ enum ae9_voice_setting {
 	AE9_VOICE_SETTING_COUNT,
 	AE9_VOICE_FOCUS = AE9_VOICE_SETTING_COUNT,
 	AE9_VOICE_ACTIVE,
+	AE9_VOICE_PENDING,
+	AE9_VOICE_ERROR,
 };
 
 struct ae9_voice_config {
@@ -1180,6 +1194,8 @@ struct ae9_voice_state {
 	bool source_dirty;
 	unsigned int rate;
 	unsigned int format;
+	unsigned int stream_tag;
+	u64 generation;
 };
 
 /* AE9_VOICE_TYPES_END */
@@ -1236,6 +1252,7 @@ enum ae9_mode_action {
 	AE9_MODE_DIRECT,
 	AE9_MODE_SBX_BUTTON,
 	AE9_MODE_OUTFX,
+	AE9_MODE_VOICE,
 };
 
 struct ae9_ctl_value {
@@ -1302,6 +1319,31 @@ struct ca0132_spec {
 	/* Protected by ae9_scp_mutex; only a confirmed DSP reset clears it. */
 	bool ae9_scp_desynced;
 	bool ae9_scp_word_started;
+	/* RX uncertainty must not feed a late reply into the next GET. */
+	bool ae9_scp_rx_desynced;
+	/* Announcements are hints, not reply identities or frame counts. */
+	atomic_t ae9_scp_announced;
+	wait_queue_head_t ae9_scp_wait;
+	/* Protected by ae9_scp_mutex; sequences survive DSP reset. */
+	int ae9_scp_drained;
+	struct {
+		const char *phase;
+		unsigned int reg, status_reg, status, expected, header;
+		unsigned int received, announced, dropped;
+		int hda_error;
+		bool logged, io_valid, status_valid, header_valid, waiting, timed_out;
+	} ae9_scp_rx;
+	/* First write failure; all access is under ae9_scp_mutex. */
+	struct {
+		const char *phase;
+		unsigned int reg, data, status, ready_status;
+		/* index: zero-based word, also the completed prefix; count: total. */
+		unsigned int word, index, count;
+		int hda_error, error;
+		bool active, failed, status_valid, ready_valid;
+		/* Reply OK/EMPTY is not proof that the DSP accepted the word. */
+		bool low_reply_ok, high_reply_ok, timed_out;
+	} ae9_scp_diag;
 	unsigned int dsp_stream_id;
 	unsigned int wait_scp;
 	unsigned int wait_scp_header;
@@ -1353,6 +1395,12 @@ struct ca0132_spec {
 	 * This cache records commands, not hardware readback.
 	 */
 	struct mutex ae9_dac_mutex;
+	/* Protected by mem_mutex, independent of the Linux stream binding. */
+	struct {
+		u64 generation;
+		unsigned int rate, output;
+		bool valid, gpio5_high;
+	} ae9_dac_start;
 	u8 ae9_dac_reg7;
 	u8 ae9_dac_volume[2];
 	bool ae9_dac_user_muted;
@@ -1382,6 +1430,10 @@ struct ca0132_spec {
 	bool ae9_mode_fx_value;
 	int ae9_mode_error;
 	int ae9_mode_result;
+	struct ae9_voice_config ae9_mode_voice;
+	u64 ae9_mode_voice_generation;
+	unsigned int ae9_mode_voice_source;
+	int ae9_voice_error;
 	struct delayed_work ae9_acm_work; /* ACM service, knob and display */
 	spinlock_t ae9_acm_work_lock;
 	bool ae9_acm_active;
@@ -1507,6 +1559,7 @@ enum {
 #define ca0132_use_alt_controls(spec)	({ (void)(spec); false; })
 #endif
 
+static void ae9_dac_start_invalidate(struct ca0132_spec *spec);
 static void ae9_acm_display_changed(struct ca0132_spec *spec);
 static void ae9_acm_stop(struct ca0132_spec *spec, bool removing);
 static void ae9_mode_stop(struct ca0132_spec *spec, bool removing);
@@ -1950,6 +2003,7 @@ static int chipio_send(struct hda_codec *codec,
 		       unsigned int reg,
 		       unsigned int data)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int res;
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 
@@ -1959,7 +2013,13 @@ static int chipio_send(struct hda_codec *codec,
 					 reg, data);
 		if (res == VENDOR_STATUS_CHIPIO_OK)
 			return 0;
-		msleep(20);
+		/* AE-9 posted reads can complete before a 20 ms backoff. */
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    reg == VENDOR_CHIPIO_STATUS &&
+		    res == VENDOR_STATUS_CHIPIO_BUSY)
+			usleep_range(500, 1000);
+		else
+			msleep(20);
 	} while (time_before(jiffies, timeout));
 
 	return -EIO;
@@ -2415,6 +2475,38 @@ static void chipio_enable_clocks(struct hda_codec *codec)
 /*
  * CA0132 DSP IO stuffs
  */
+/* Observe only results of commands already issued by the SCP writer. */
+static void ae9_scp_diag_sample(struct hda_codec *codec, const char *phase,
+				unsigned int reg, unsigned int data,
+				int err, unsigned int status)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (!spec->ae9_scp_diag.active || spec->ae9_scp_diag.failed)
+		return;
+	spec->ae9_scp_diag.phase = phase;
+	spec->ae9_scp_diag.reg = reg;
+	spec->ae9_scp_diag.data = data;
+	spec->ae9_scp_diag.hda_error = err;
+	spec->ae9_scp_diag.status_valid = !err;
+	/* A failed HDA read supplies no vendor status, even if it wrote *res. */
+	spec->ae9_scp_diag.status = err ? 0 : status;
+}
+
+/* Preserve snd_hda_codec_read's -1 sentinel while retaining the HDA errno. */
+static unsigned int ae9_scp_diag_status(struct hda_codec *codec,
+				      const char *phase)
+{
+	unsigned int status;
+	int err;
+
+	err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL,
+			    VENDOR_DSPIO_STATUS, 0, &status);
+	ae9_scp_diag_sample(codec, phase, VENDOR_DSPIO_STATUS, 0, err,
+			    err ? 0 : status);
+	return err ? ~0U : status;
+}
+
 static int dspio_send(struct hda_codec *codec, unsigned int reg,
 		      unsigned int data)
 {
@@ -2432,6 +2524,10 @@ static int dspio_send(struct hda_codec *codec, unsigned int reg,
 			/* An HDA error does not prove the half-word was rejected. */
 			err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL,
 					    reg, data, &status);
+			ae9_scp_diag_sample(codec,
+				reg == VENDOR_DSPIO_SCP_WRITE_DATA_LOW ?
+				"low" : "high", reg, data, err,
+				err ? 0 : status);
 			if (err < 0)
 				return err;
 			if (status > VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
@@ -2446,6 +2542,9 @@ static int dspio_send(struct hda_codec *codec, unsigned int reg,
 		msleep(20);
 	} while (time_before(jiffies, timeout));
 
+	if (ae9_scp_write && spec->ae9_scp_diag.active &&
+	    !spec->ae9_scp_diag.failed)
+		spec->ae9_scp_diag.timed_out = true;
 	return -EIO;
 }
 
@@ -2460,8 +2559,11 @@ static int dspio_write_wait(struct hda_codec *codec)
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 
 	do {
-		status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
-						VENDOR_DSPIO_STATUS, 0);
+		if (ae9)
+			status = ae9_scp_diag_status(codec, "ready");
+		else
+			status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
+						    VENDOR_DSPIO_STATUS, 0);
 		if ((status == VENDOR_STATUS_DSPIO_OK) ||
 		    (status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY))
 			return 0;
@@ -2471,6 +2573,8 @@ static int dspio_write_wait(struct hda_codec *codec)
 		msleep(1);
 	} while (time_before(jiffies, timeout));
 
+	if (ae9 && spec->ae9_scp_diag.active && !spec->ae9_scp_diag.failed)
+		spec->ae9_scp_diag.timed_out = true;
 	return ae9 ? -ETIMEDOUT : 0;
 }
 
@@ -2490,6 +2594,11 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 	if (status < 0)
 		return status;
 
+	if (ae9 && spec->ae9_scp_diag.active && !spec->ae9_scp_diag.failed) {
+		spec->ae9_scp_diag.ready_status = spec->ae9_scp_diag.status;
+		spec->ae9_scp_diag.ready_valid = spec->ae9_scp_diag.status_valid;
+	}
+
 	guard(mutex)(&spec->chipio_mutex);
 	if (ae9)
 		spec->ae9_scp_word_started = true;
@@ -2501,6 +2610,9 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
 		return -EIO;
 
+	if (ae9 && spec->ae9_scp_diag.active && !spec->ae9_scp_diag.failed)
+		spec->ae9_scp_diag.low_reply_ok = true;
+
 	status = dspio_send(codec, VENDOR_DSPIO_SCP_WRITE_DATA_HIGH,
 				    scp_data >> 16);
 	if (status < 0)
@@ -2509,11 +2621,17 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
 		return -EIO;
 
+	if (ae9 && spec->ae9_scp_diag.active && !spec->ae9_scp_diag.failed)
+		spec->ae9_scp_diag.high_reply_ok = true;
+
 	/* Never resend a word whose acceptance is uncertain. */
 	timeout = jiffies + msecs_to_jiffies(1000);
 	do {
-		status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
-					    VENDOR_DSPIO_STATUS, 0);
+		if (ae9)
+			status = ae9_scp_diag_status(codec, "post");
+		else
+			status = snd_hda_codec_read(codec, WIDGET_DSP_CTRL, 0,
+						    VENDOR_DSPIO_STATUS, 0);
 		if (!ae9)
 			return status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL ?
 				-EIO : 0;
@@ -2527,6 +2645,8 @@ static int dspio_write(struct hda_codec *codec, unsigned int scp_data)
 		usleep_range(1000, 1500);
 	} while (time_before(jiffies, timeout));
 
+	if (spec->ae9_scp_diag.active && !spec->ae9_scp_diag.failed)
+		spec->ae9_scp_diag.timed_out = true;
 	return -ETIMEDOUT;
 }
 
@@ -2547,14 +2667,28 @@ static int dspio_write_multiple(struct hda_codec *codec,
 	if (ae9 && spec->ae9_scp_desynced)
 		return -EPIPE;
 
+	if (ae9 && !spec->ae9_scp_diag.failed) {
+		memset(&spec->ae9_scp_diag, 0, sizeof(spec->ae9_scp_diag));
+		spec->ae9_scp_diag.active = true;
+		spec->ae9_scp_diag.count = size;
+	}
 	count = 0;
 	while (count < size) {
+		if (ae9 && !spec->ae9_scp_diag.failed) {
+			spec->ae9_scp_diag.word = *buffer;
+			spec->ae9_scp_diag.index = count;
+			spec->ae9_scp_diag.ready_valid = false;
+			spec->ae9_scp_diag.low_reply_ok = false;
+			spec->ae9_scp_diag.high_reply_ok = false;
+		}
 		status = dspio_write(codec, *buffer++);
 		if (status != 0)
 			break;
 		count++;
 	}
 
+	if (ae9 && status < 0)
+		ae9_dac_start_invalidate(spec);
 	if (ae9 && status < 0 && (count || spec->ae9_scp_word_started)) {
 		/* Never feed a new header into an unfinished or uncertain word. */
 		spec->ae9_scp_desynced = true;
@@ -2563,6 +2697,37 @@ static int dspio_write_multiple(struct hda_codec *codec,
 			  count, size, status);
 	}
 
+	if (ae9 && spec->ae9_scp_diag.active) {
+		spec->ae9_scp_diag.active = false;
+		if (status < 0 && !spec->ae9_scp_diag.failed) {
+			char status_text[16], ready_text[16];
+
+			if (spec->ae9_scp_diag.status_valid)
+				snprintf(status_text, sizeof(status_text), "0x%08x",
+					 spec->ae9_scp_diag.status);
+			else
+				snprintf(status_text, sizeof(status_text), "unavailable");
+			if (spec->ae9_scp_diag.ready_valid)
+				snprintf(ready_text, sizeof(ready_text), "0x%08x",
+					 spec->ae9_scp_diag.ready_status);
+			else
+				snprintf(ready_text, sizeof(ready_text), "unavailable");
+			spec->ae9_scp_diag.failed = true;
+			spec->ae9_scp_diag.error = status;
+			codec_err(codec,
+				  "AE-9: first SCP write failure: phase=%s err=%d nid=0x%02x reg=0x%03x data=0x%04x hda_err=%d status_valid=%u status=%s word=0x%08x index=%u count=%u ready_valid=%u ready=%s low_reply_ok=%u high_reply_ok=%u timeout=%u\n",
+				  spec->ae9_scp_diag.phase, status, WIDGET_DSP_CTRL,
+				  spec->ae9_scp_diag.reg, spec->ae9_scp_diag.data,
+				  spec->ae9_scp_diag.hda_error,
+				  spec->ae9_scp_diag.status_valid,
+				  status_text, spec->ae9_scp_diag.word,
+				  spec->ae9_scp_diag.index, spec->ae9_scp_diag.count,
+				  spec->ae9_scp_diag.ready_valid,
+				  ready_text,
+				  spec->ae9_scp_diag.low_reply_ok, spec->ae9_scp_diag.high_reply_ok,
+				  spec->ae9_scp_diag.timed_out);
+		}
+	}
 	return status;
 }
 
@@ -2757,6 +2922,215 @@ static int dspio_get_response_data(struct hda_codec *codec)
 	return -EIO;
 }
 
+/* The receive budget belongs to the transaction, never to an individual word. */
+static int ae9_scp_rx_status(struct hda_codec *codec, unsigned int reg,
+			      unsigned long deadline)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int value;
+	int err;
+
+	for (;;) {
+		if (!time_before(jiffies, deadline)) {
+			spec->ae9_scp_rx.timed_out = true;
+			return -EIO;
+		}
+		spec->ae9_scp_rx.reg = reg;
+		spec->ae9_scp_rx.phase =
+			reg == VENDOR_DSPIO_STATUS ? "status" : "post";
+		spec->ae9_scp_rx.io_valid = true;
+		spec->ae9_scp_rx.status_valid = false;
+		spec->ae9_scp_rx.status_reg = reg;
+		err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL, reg, 0,
+				    &value);
+		if (err < 0) {
+			spec->ae9_scp_rx.hda_error = err;
+			return err;
+		}
+		spec->ae9_scp_rx.status = value;
+		spec->ae9_scp_rx.status_valid = true;
+		if (value == VENDOR_STATUS_DSPIO_OK)
+			return 0;
+		/* POST=3 stays an error: it does not prove non-consumption. */
+		/* Only STATUS=EMPTY establishes that no READ_DATA was issued. */
+		if (reg == VENDOR_DSPIO_STATUS &&
+		    value == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+			return -EAGAIN;
+		if (value != VENDOR_STATUS_DSPIO_BUSY)
+			return -EIO;
+		if (time_before(jiffies, deadline))
+			msleep(min_t(unsigned int, 20,
+				     jiffies_to_msecs(deadline - jiffies)));
+	}
+}
+
+static int ae9_scp_rx_word(struct hda_codec *codec, unsigned int *word,
+			    unsigned long deadline)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	err = ae9_scp_rx_status(codec, VENDOR_DSPIO_SCP_POST_READ_DATA,
+				deadline);
+	if (err < 0)
+		return err;
+	err = ae9_scp_rx_status(codec, VENDOR_DSPIO_STATUS, deadline);
+	if (err < 0)
+		return err;
+	if (!time_before(jiffies, deadline)) {
+		spec->ae9_scp_rx.timed_out = true;
+		return -EIO;
+	}
+	spec->ae9_scp_rx.phase = "data";
+	spec->ae9_scp_rx.reg = VENDOR_DSPIO_SCP_READ_DATA;
+	err = snd_hdac_read(&codec->core, WIDGET_DSP_CTRL,
+			    VENDOR_DSPIO_SCP_READ_DATA, 0, word);
+	if (err < 0)
+		spec->ae9_scp_rx.hda_error = err;
+	return err;
+}
+
+static void ae9_scp_rx_error(struct hda_codec *codec, int err)
+{
+	struct ca0132_spec *spec = codec->spec;
+	char status[16], header[16];
+
+	if (spec->ae9_scp_rx.logged)
+		return;
+	spec->ae9_scp_rx.logged = true;
+	if (spec->ae9_scp_rx.status_valid)
+		snprintf(status, sizeof(status), "0x%08x", spec->ae9_scp_rx.status);
+	else
+		snprintf(status, sizeof(status), "unavailable");
+	if (spec->ae9_scp_rx.header_valid)
+		snprintf(header, sizeof(header), "0x%08x", spec->ae9_scp_rx.header);
+	else
+		snprintf(header, sizeof(header), "unavailable");
+	codec_err(codec,
+		  "AE-9: first SCP receive failure: phase=%s err=%d nid=0x%02x io_valid=%u reg=0x%03x hda_err=%d status_reg=0x%03x status_valid=%u status=%s waiting=%u expected=0x%06x header_valid=%u header=%s received=%u announced=%u dropped=%u timeout=%u blocked=%u\n",
+		  spec->ae9_scp_rx.phase, err, WIDGET_DSP_CTRL,
+		  spec->ae9_scp_rx.io_valid, spec->ae9_scp_rx.reg,
+		  spec->ae9_scp_rx.hda_error, spec->ae9_scp_rx.status_reg,
+		  spec->ae9_scp_rx.status_valid, status,
+		  spec->ae9_scp_rx.waiting, spec->ae9_scp_rx.expected,
+		  spec->ae9_scp_rx.header_valid, header,
+		  spec->ae9_scp_rx.received, spec->ae9_scp_rx.announced,
+		  spec->ae9_scp_rx.dropped, spec->ae9_scp_rx.timed_out,
+		  spec->ae9_scp_rx_desynced);
+}
+
+/* SCP ownership keeps a waiting GET as the only RX consumer. */
+static int ae9_scp_receive(struct hda_codec *codec, unsigned long deadline,
+			   bool waiting)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int data[SCP_MAX_DATA_WORDS], word;
+	bool logged = spec->ae9_scp_rx.logged;
+	int err;
+
+	memset(&spec->ae9_scp_rx, 0, sizeof(spec->ae9_scp_rx));
+	spec->ae9_scp_rx.logged = logged;
+	spec->ae9_scp_rx.phase = "deadline";
+	spec->ae9_scp_rx.waiting = waiting;
+	spec->ae9_scp_rx.expected = waiting ? spec->wait_scp_header : 0;
+	for (;;) {
+		err = ae9_scp_rx_word(codec, &word, deadline);
+		if (err == -EAGAIN && !spec->ae9_scp_rx.hda_error &&
+		    spec->ae9_scp_rx.status_valid &&
+		    spec->ae9_scp_rx.reg == VENDOR_DSPIO_STATUS &&
+		    spec->ae9_scp_rx.status ==
+				VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY) {
+			/* Idle EMPTY is safe only between complete frames. */
+			if (!waiting && !spec->ae9_scp_rx.header_valid)
+				return 0;
+			if (time_before(jiffies, deadline))
+				msleep(min_t(unsigned int, 2,
+					     jiffies_to_msecs(deadline - jiffies)));
+			continue;
+		}
+		if (err < 0)
+			goto uncertain;
+		if (!spec->ae9_scp_rx.header_valid) {
+			spec->ae9_scp_rx.header = word;
+			spec->ae9_scp_rx.header_valid = true;
+			spec->ae9_scp_rx.announced = word >> 27;
+			spec->ae9_scp_rx.received = 0;
+		} else {
+			if (spec->ae9_scp_rx.received < ARRAY_SIZE(data))
+				data[spec->ae9_scp_rx.received] = word;
+			spec->ae9_scp_rx.received++;
+		}
+		if (!time_before(jiffies, deadline)) {
+			spec->ae9_scp_rx.timed_out = true;
+			err = -EIO;
+			goto uncertain;
+		}
+		if (spec->ae9_scp_rx.received != spec->ae9_scp_rx.announced)
+			continue;
+		/* A foreign payload must never become the next reply header. */
+		if (waiting && (spec->ae9_scp_rx.header & 0x00ffffff) ==
+				spec->wait_scp_header) {
+			if (spec->ae9_scp_rx.announced > ARRAY_SIZE(data) ||
+			    spec->ae9_scp_rx.announced > spec->wait_num_data) {
+				spec->ae9_scp_rx.phase = "capacity";
+				ae9_scp_rx_error(codec, -EIO);
+				return -EIO;
+			}
+			spec->scp_resp_header = spec->ae9_scp_rx.header;
+			spec->scp_resp_count = spec->ae9_scp_rx.announced;
+			memcpy(spec->scp_resp_data, data,
+			       spec->scp_resp_count * sizeof(data[0]));
+			return 0;
+		}
+		spec->ae9_scp_rx.dropped++;
+		spec->ae9_scp_rx.header_valid = false;
+	}
+
+uncertain:
+	/* Even a header timeout can leave a late reply to an identical GET. */
+	spec->ae9_scp_rx_desynced = true;
+	ae9_dac_start_invalidate(spec);
+	ae9_scp_rx_error(codec, err);
+	return err;
+}
+
+/* Caller owns SCP; one budget covers every pending snapshot and frame. */
+static int ae9_scp_drain_pending(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
+	int announced, err;
+
+	for (;;) {
+		announced = atomic_read(&spec->ae9_scp_announced);
+		if (announced == spec->ae9_scp_drained)
+			return 0;
+		if (spec->ae9_scp_rx_desynced)
+			return -EPIPE;
+		err = ae9_scp_receive(codec, deadline, false);
+		if (err < 0)
+			return err;
+		/* EMPTY acknowledges only events seen before this drain. */
+		spec->ae9_scp_drained = announced;
+	}
+}
+
+static bool ae9_scp_await_announcement(struct hda_codec *codec,
+				      unsigned int header)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 ||
+	    spec->dsp_state != DSP_DOWNLOADED || spec->ae9_loader_ctx)
+		return false;
+#ifdef CONFIG_PM
+	if (snd_hdac_is_in_pm(&codec->core))
+		return false;
+#endif
+	/* InFX status only: GET mid=0x80, src=0x20, req=0x3d. */
+	return (header & 0x01ffffff) == 0x007b2080;
+}
+
 /*
  * Send SCP message to DSP
  */
@@ -2772,6 +3146,8 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 	unsigned int scp_send_size = 0;
 	unsigned int total_size;
 	bool waiting_for_resp = false;
+	bool await_announcement;
+	int announced = 0;
 	unsigned int header;
 	struct scp_msg *ret_msg;
 	unsigned int resp_src_id, resp_target_id;
@@ -2789,10 +3165,23 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 
 	if (send_buf_size < total_size)
 		return -EINVAL;
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		/* RX failure must not disable the existing SET cleanup path. */
+		if (!spec->ae9_scp_rx_desynced) {
+			status = ae9_scp_drain_pending(codec);
+			if (status < 0)
+				return status;
+		}
+		announced = atomic_read(&spec->ae9_scp_announced);
+	}
+	await_announcement = ae9_scp_await_announcement(codec, header);
 
 	if (get_flag || device_flag) {
 		if (!return_buf || return_buf_size < 4 || !bytes_returned)
 			return -EINVAL;
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    spec->ae9_scp_rx_desynced)
+			return -EPIPE;
 
 		spec->wait_scp_header = *((unsigned int *)send_buf);
 
@@ -2820,6 +3209,18 @@ static int dspio_send_scp_message(struct hda_codec *codec,
 	if (waiting_for_resp) {
 		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 		memset(return_buf, 0, return_buf_size);
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			if (await_announcement && time_before(jiffies, timeout))
+				wait_event_timeout(spec->ae9_scp_wait,
+					atomic_read(&spec->ae9_scp_announced) !=
+						announced,
+					min(msecs_to_jiffies(200),
+					    timeout - jiffies));
+			status = ae9_scp_receive(codec, timeout, true);
+			spec->wait_scp = 0;
+			if (status < 0)
+				return status;
+		}
 		do {
 			/*
 			 * Poll the SCP response queue ourselves, as the Windows
@@ -3175,6 +3576,9 @@ static int __dsp_reset(struct hda_codec *codec)
 	if (ca0132_quirk(spec) == QUIRK_AE9 && res == VENDOR_STATUS_DSPIO_OK) {
 		spec->ae9_scp_desynced = false;
 		spec->ae9_scp_word_started = false;
+		spec->ae9_scp_rx_desynced = false;
+		memset(&spec->ae9_scp_rx, 0, sizeof(spec->ae9_scp_rx));
+		memset(&spec->ae9_scp_diag, 0, sizeof(spec->ae9_scp_diag));
 	}
 
 	return 0;
@@ -4459,11 +4863,46 @@ static inline void ca0113_mmio_writeb(struct ca0132_spec *spec,
 	readb(spec->mem_base + off);
 }
 
-static inline void ca0113_mmio_writew(struct ca0132_spec *spec,
+static inline u16 ca0113_mmio_writew(struct ca0132_spec *spec,
 				      unsigned int off, unsigned short val)
 {
 	writew(val, spec->mem_base + off);
-	readw(spec->mem_base + off);
+	return readw(spec->mem_base + off);
+}
+
+/* No acknowledgment or physical-lock claim: cache successful prepare commands. */
+static void ae9_dac_start_dirty_locked(struct ca0132_spec *spec)
+{
+	lockdep_assert_held(&spec->mem_mutex);
+	spec->ae9_dac_start.valid = false;
+	spec->ae9_dac_start.generation++;
+}
+
+static void ae9_dac_start_invalidate(struct ca0132_spec *spec)
+{
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	guard(mutex)(&spec->mem_mutex);
+	ae9_dac_start_dirty_locked(spec);
+	spec->ae9_dac_start.gpio5_high = false;
+}
+
+/* Only the normal mute/filter, volume and unchanged output writes are benign. */
+static void ae9_dac_start_command_locked(struct ca0132_spec *spec,
+					 unsigned int group,
+					 unsigned int reg, unsigned int value)
+{
+	unsigned int output;
+
+	lockdep_assert_held(&spec->mem_mutex);
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	output = spec->ae9_dac_start.output == HEADPHONE_OUT ? 0x80 : 0x40;
+	if (group == 0x48 &&
+	    ((reg == 0x07 && !(value & ~(AE9_DAC_FILTER_MASK | 1))) ||
+	     reg == 0x0f || reg == 0x10 || (reg == 0x1d && value == output)))
+		return;
+	ae9_dac_start_dirty_locked(spec);
 }
 
 /*
@@ -4479,6 +4918,21 @@ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
 	gpio_data = gpio_pin & 0xF;
 	gpio_data |= ((enable << 8) & 0x100);
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		guard(mutex)(&spec->mem_mutex);
+		/* Periodic GPIO5 keepalive preserves an already powered ACM. */
+		if (gpio_pin != 5 || !enable || !spec->ae9_dac_start.gpio5_high)
+			ae9_dac_start_dirty_locked(spec);
+		if (gpio_pin != 5)
+			spec->ae9_dac_start.gpio5_high = false;
+		if (ca0113_mmio_writew(spec, 0x320, gpio_data) == 0xffff) {
+			ae9_dac_start_dirty_locked(spec);
+			spec->ae9_dac_start.gpio5_high = false;
+		} else if (gpio_pin == 5) {
+			spec->ae9_dac_start.gpio5_high = enable;
+		}
+		return;
+	}
 	ca0113_mmio_writew(spec, 0x320, gpio_data);
 }
 
@@ -4487,14 +4941,15 @@ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
  * group, target and value. Preserve the existing reads: early tests without
  * them left the card unresponsive; their exact side effects remain uncertain.
  */
-static void ca0113_mmio_command_set_delay(struct hda_codec *codec,
-					  unsigned int group, unsigned int target,
-					  unsigned int value, bool fast)
+static void ca0113_mmio_command_set_locked(struct hda_codec *codec,
+					   unsigned int group, unsigned int target,
+					   unsigned int value, bool fast)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int write_val;
 
-	guard(mutex)(&spec->mem_mutex);
+	lockdep_assert_held(&spec->mem_mutex);
+	ae9_dac_start_command_locked(spec, group, target & 0xff, value);
 	ca0113_mmio_writel(spec, 0x210, 0x0000007e);
 	readl(spec->mem_base + 0x210);
 	ca0113_mmio_writel(spec, 0x210, 0x0000005a);
@@ -4524,6 +4979,46 @@ static void ca0113_mmio_command_set_delay(struct hda_codec *codec,
 	ca0113_mmio_writel(spec, 0x210, 0x00000000);
 	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
+}
+
+static void ca0113_mmio_command_set_delay(struct hda_codec *codec,
+					  unsigned int group, unsigned int target,
+					  unsigned int value, bool fast)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->mem_mutex);
+	ca0113_mmio_command_set_locked(codec, group, target, value, fast);
+}
+
+/* Consume a previous success; a partial prepare must never publish a cache hit. */
+static u64 ae9_dac_start_begin(struct hda_codec *codec, unsigned int rate)
+{
+	struct ca0132_spec *spec = codec->spec;
+	bool reuse;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	guard(mutex)(&spec->mem_mutex);
+	reuse = spec->ae9_dac_start.valid && !spec->ae9_direct.switching &&
+		spec->ae9_dac_start.rate == rate &&
+		spec->ae9_dac_start.output == spec->cur_out_type;
+	spec->ae9_dac_start.valid = false;
+	spec->ae9_dac_start.rate = rate;
+	spec->ae9_dac_start.output = spec->cur_out_type;
+	if (!reuse) {
+		ca0113_mmio_command_set_locked(codec, 0x48, 0x01, 0xc0, false);
+		ca0113_mmio_command_set_locked(codec, 0x48, 0x0a, 0x02, false);
+	}
+	return spec->ae9_dac_start.generation;
+}
+
+static void ae9_dac_start_finish(struct ca0132_spec *spec, u64 generation)
+{
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	guard(mutex)(&spec->mem_mutex);
+	if (!spec->ae9_direct.switching &&
+	    generation == spec->ae9_dac_start.generation)
+		spec->ae9_dac_start.valid = true;
 }
 
 static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
@@ -4672,6 +5167,8 @@ static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
 	unsigned int write_val;
 
 	guard(mutex)(&spec->mem_mutex);
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		ae9_dac_start_dirty_locked(spec);
 	ca0113_mmio_writel(spec, 0x210, 0x0000007e);
 	readl(spec->mem_base + 0x210);
 	ca0113_mmio_writel(spec, 0x210, 0x0000005a);
@@ -4893,6 +5390,7 @@ static int ae9_direct_set_locked(struct ca0132_spec *spec, bool enabled)
 		return 0;
 	if (enabled && (spec->ae9_direct.opened & AE9_PCM_WUH))
 		return -EBUSY;
+	ae9_dac_start_invalidate(spec);
 	spec->ae9_direct.enabled = enabled;
 	spec->ae9_direct.valid = false;
 	return 1;
@@ -4981,10 +5479,71 @@ static void ae9_output_invalidate(struct hda_codec *codec)
 	if (ca0132_quirk(spec) != QUIRK_AE9)
 		return;
 	guard(mutex)(&spec->ae9_output_mutex);
+	ae9_dac_start_invalidate(spec);
 	spec->ae9_output_applied = false;
 	spec->ae9_direct.valid = false;
 	spec->ae9_direct.dsp_pair_valid = false;
 	spec->ae9_acm_pending_mode = false;
+}
+
+/* Reuse only an intact PREPARED transport, never a recovery prepare. */
+static int ae9_direct_reprepare_locked(struct hda_codec *codec,
+				      unsigned int stream_tag,
+				      unsigned int format,
+				      struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_direct_state *direct = &spec->ae9_direct;
+	unsigned int value;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (snd_pcm_get_state(substream) != SNDRV_PCM_STATE_PREPARED ||
+	    !direct->enabled || spec->dsp_state != DSP_DOWNLOADED ||
+	    !direct->valid || !direct->prepared ||
+	    !spec->ae9_output_applied || direct->switching ||
+	    !direct->dsp_ref_held || direct->dsp_ref_unknown ||
+	    !stream_tag || stream_tag > 15 ||
+	    direct->stream_tag != stream_tag ||
+	    direct->stream_format != format ||
+	    direct->rate != substream->runtime->rate ||
+	    direct->stream_rate != substream->runtime->rate)
+		return 0;
+	guard(mutex)(&spec->ae9_voice.mutex);
+	scoped_guard(mutex, &spec->ae9_dac_mutex) {
+		if (spec->ae9_dac_forced_mute)
+			return 0;
+	}
+	/* A held flag alone does not establish a live DSP reference. */
+	err = ae9_direct_hold_dsp(codec);
+	if (err < 0)
+		goto fail;
+	err = snd_hdac_read(&codec->core, spec->dacs[0],
+			    AC_VERB_GET_STREAM_FORMAT, 0, &value);
+	if (err < 0)
+		goto fail;
+	if (value != format) {
+		ae9_dac_start_invalidate(spec);
+		return 0;
+	}
+	err = snd_hdac_read(&codec->core, spec->dacs[0],
+			    AC_VERB_GET_CONV, 0, &value);
+	if (err < 0)
+		goto fail;
+	if (value != (stream_tag << 4)) {
+		ae9_dac_start_invalidate(spec);
+		return 0;
+	}
+	return 1;
+fail:
+	ae9_dac_start_invalidate(spec);
+	direct->stream_tag = 0;
+	direct->prepared = false;
+	direct->valid = false;
+	direct->dsp_pair_valid = false;
+	spec->ae9_output_applied = false;
+	spec->ae9_acm_pending_mode = false;
+	return err;
 }
 
 /* Cache only a successfully prepared Linux transport, under output_mutex. */
@@ -5001,10 +5560,16 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		int err;
 
 		guard(mutex)(&spec->ae9_output_mutex);
+		err = ae9_direct_reprepare_locked(codec, stream_tag, format,
+						  substream);
+		if (err)
+			return err < 0 ? err : 0;
 		direct->stream_tag = 0;
 		direct->prepared = false;
-		if (spec->dsp_state != DSP_DOWNLOADED || direct->dsp_ref_unknown)
+		if (spec->dsp_state != DSP_DOWNLOADED || direct->dsp_ref_unknown) {
+			ae9_dac_start_invalidate(spec);
 			return -EIO;
+		}
 		if (direct->enabled) {
 			err = ae9_direct_prepare_locked(codec,
 							substream->runtime->rate,
@@ -5690,9 +6255,12 @@ static void ae5_mmio_select_out(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	const struct ae_ca0113_output_set *out_cmds;
+	int quirk = ca0132_quirk(spec);
 	unsigned int i;
 
-	if ((ca0132_quirk(spec) == QUIRK_AE5 || ca0132_quirk(spec) == QUIRK_AE9))
+	if (quirk == QUIRK_AE9)
+		out_cmds = &ae9_ca0113_output_presets;
+	else if (quirk == QUIRK_AE5)
 		out_cmds = &ae5_ca0113_output_presets;
 	else
 		out_cmds = &ae7_ca0113_output_presets;
@@ -7022,7 +7590,11 @@ static int ca0132_alt_mic_boost_set(struct hda_codec *codec, long val)
 
 static int ae5_headphone_gain_set(struct hda_codec *codec, long val)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int i;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		lockdep_assert_held(&spec->ae9_output_mutex);
 
 	for (i = 0; i < 4; i++)
 		ca0113_mmio_command_set(codec, 0x48, 0x11 + i,
@@ -7418,6 +7990,13 @@ static int ae5_headphone_gain_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		scoped_guard(mutex, &spec->ae9_output_mutex)
+			ucontrol->value.enumerated.item[0] =
+				spec->ae5_headphone_gain_val;
+		return 0;
+	}
+
 	ucontrol->value.enumerated.item[0] = spec->ae5_headphone_gain_val;
 	return 0;
 }
@@ -7431,7 +8010,24 @@ static int ae5_headphone_gain_put(struct snd_kcontrol *kcontrol,
 	unsigned int items = AE5_HEADPHONE_GAIN_MAX;
 
 	if (sel >= items)
-		return 0;
+		return ca0132_quirk(spec) == QUIRK_AE9 ? -EINVAL : 0;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		int err;
+
+		CLASS(snd_hda_power_pm, pm)(codec);
+		err = ae9_pm_error(codec, pm.err);
+		if (err < 0)
+			return err;
+		/* The jack worker holds this across its route and gain writes. */
+		guard(mutex)(&spec->ae9_output_mutex);
+		if (spec->ae5_headphone_gain_val == sel)
+			return 0;
+		spec->ae5_headphone_gain_val = sel;
+		if (spec->out_enum_val == HEADPHONE_OUT)
+			ae5_headphone_gain_set(codec, sel);
+		return 1;
+	}
 
 	codec_dbg(codec, "ae5_headphone_gain: boost=%d\n",
 		    sel);
@@ -7798,6 +8394,13 @@ static int ca0132_alt_svm_setting_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		scoped_guard(mutex, &spec->ae9_output_mutex)
+			ucontrol->value.enumerated.item[0] =
+				spec->smart_volume_setting;
+		return 0;
+	}
+
 	ucontrol->value.enumerated.item[0] = spec->smart_volume_setting;
 	return 0;
 }
@@ -7811,14 +8414,18 @@ static int ca0132_alt_svm_setting_put(struct snd_kcontrol *kcontrol,
 	unsigned int items = NUM_OF_SVM_SETTINGS;
 	unsigned int idx = SMART_VOLUME - EFFECT_START_NID;
 	unsigned int tmp;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
+	int old = spec->smart_volume_setting;
+	int err;
 
 	if (sel >= items)
-		return 0;
+		return ae9 ? -EINVAL : 0;
 
 	codec_dbg(codec, "ca0132_alt_svm_setting: sel=%d, preset=%s\n",
 		    sel, out_svm_set_enum_str[sel]);
 
-	spec->smart_volume_setting = sel;
+	if (!ae9)
+		spec->smart_volume_setting = sel;
 
 	switch (sel) {
 	case 0:
@@ -7835,8 +8442,14 @@ static int ca0132_alt_svm_setting_put(struct snd_kcontrol *kcontrol,
 		break;
 	}
 	/* Req 2 is the Smart Volume Setting req. */
-	dspio_set_uint_param(codec, ca0132_effects[idx].mid,
+	err = dspio_set_uint_param(codec, ca0132_effects[idx].mid,
 			ca0132_effects[idx].reqs[2], tmp);
+	if (ae9) {
+		if (err < 0)
+			return err;
+		spec->smart_volume_setting = sel;
+		return old != sel;
+	}
 	return 1;
 }
 
@@ -7874,6 +8487,12 @@ static int ca0132_alt_eq_preset_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		scoped_guard(mutex, &spec->ae9_output_mutex)
+			ucontrol->value.enumerated.item[0] = spec->eq_preset_val;
+		return 0;
+	}
+
 	ucontrol->value.enumerated.item[0] = spec->eq_preset_val;
 	return 0;
 }
@@ -7886,15 +8505,19 @@ static int ca0132_alt_eq_preset_put(struct snd_kcontrol *kcontrol,
 	int i, err = 0;
 	int sel = ucontrol->value.enumerated.item[0];
 	unsigned int items = ARRAY_SIZE(ca0132_alt_eq_presets);
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
+	int old = spec->eq_preset_val;
 
 	if (sel >= items)
-		return 0;
+		return ae9 ? -EINVAL : 0;
 
 	codec_dbg(codec, "%s: sel=%d, preset=%s\n", __func__, sel,
 			ca0132_alt_eq_presets[sel].name);
 	/*
 	 * Idx 0 is default.
 	 * Default needs to qualify with CrystalVoice state.
+	 * Always reprogram, even the cached preset: an earlier error may have
+	 * left only a prefix applied. This is not a hardware rollback.
 	 */
 	for (i = 0; i < EQ_PRESET_MAX_PARAM_COUNT; i++) {
 		err = dspio_set_uint_param(codec, ca0132_alt_eq_enum.mid,
@@ -7904,10 +8527,12 @@ static int ca0132_alt_eq_preset_put(struct snd_kcontrol *kcontrol,
 			break;
 	}
 
+	if (ae9 && err < 0)
+		return err;
 	if (err >= 0)
 		spec->eq_preset_val = sel;
 
-	return 1;
+	return ae9 ? old != sel : 1;
 }
 
 static int ae9_eq_preset_put(struct snd_kcontrol *kcontrol,
@@ -8273,8 +8898,10 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 	muted = !left_on && !right_on;
 
 	guard(mutex)(&spec->ae9_dac_mutex);
-	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U)
+	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U) {
+		ae9_dac_start_invalidate(spec);
 		return -ENODEV;
+	}
 	/* ESS digital volume is unavailable with the oversampling bypassed. */
 	if (spec->ae9_dac_reg7 & BIT(1))
 		return -EOPNOTSUPP;
@@ -9287,6 +9914,7 @@ static const struct ae9_miceq_preset {
 /* Caller holds voice->mutex; retain the logical PCM setup. */
 static void ae9_voice_invalidate_input_locked(struct ae9_voice_state *voice)
 {
+	voice->generation++;
 	voice->source_dirty = true;
 	voice->applied_valid = false;
 	voice->gain_valid = false;
@@ -9401,10 +10029,18 @@ static int ae9_voice_status(struct hda_codec *codec)
 
 	err = dspio_scp(codec, 0x80, 0x20, 0x3d, SCP_GET, NULL, 0,
 			&status, &size);
-	if (err < 0)
+	if (err < 0) {
+		codec_err(codec,
+			  "AE-9 voice failed: stage=status-scp err=%d bytes_valid=0 status_valid=0\n",
+			  err);
 		return err;
+	}
 	if (size == sizeof(status))
 		codec_info(codec, "AE-9 voice: status=0x%08x bytes=%u\n", status, size);
+	else
+		codec_err(codec,
+			  "AE-9 voice failed: stage=status-size err=%d bytes_valid=1 bytes=%u status_valid=0\n",
+			  -EIO, size);
 	return size == sizeof(status) ? 0 : -EIO;
 }
 
@@ -9604,6 +10240,162 @@ static int ae9_voice_update(struct hda_codec *codec,
 	return 1;
 }
 
+/* Keep HDA's cached PCM setup intact across this temporary ADC detach. */
+static int ae9_voice_bind(struct hda_codec *codec, unsigned int stream)
+{
+	struct ca0132_spec *spec = codec->spec;
+	const char *stage = "write";
+	unsigned int actual = 0;
+	bool actual_valid = false;
+	int err;
+
+	err = snd_hda_codec_write(codec, spec->adcs[0], 0,
+				  AC_VERB_SET_CHANNEL_STREAMID, stream);
+	if (err < 0)
+		goto fail;
+	stage = "read";
+	err = snd_hdac_read(&codec->core, spec->adcs[0], AC_VERB_GET_CONV,
+			    0, &actual);
+	if (err < 0)
+		goto fail;
+	actual_valid = true;
+	if (actual == stream)
+		return 0;
+	stage = "mismatch";
+	err = -EIO;
+fail:
+	codec_err(codec,
+		  "AE-9 voice bind failed: stage=%s err=%d requested=0x%02x actual_valid=%u actual=0x%02x\n",
+		  stage, err, stream, actual_valid, actual_valid ? actual : 0);
+	return err;
+}
+
+/* Caller holds the existing prepare/output/voice locks; no diagnostic I/O. */
+static void ae9_voice_live_error_locked(struct hda_codec *codec,
+					const char *stage, int err,
+					unsigned int stream, bool stream_valid,
+					unsigned int format, bool format_valid)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+
+	lockdep_assert_held(&voice->mutex);
+	codec_err(codec,
+		  "AE-9 voice live failed: stage=%s err=%d prepared=%u suspended=%u source_dirty=%u dsp=%d route=%u applied_valid=%u rate=%u expected_tag=%u expected_format=0x%04x stream_valid=%u stream=0x%02x format_valid=%u format=0x%04x\n",
+		  stage, err, voice->prepared, voice->suspended,
+		  voice->source_dirty, spec->dsp_state, voice->route,
+		  voice->applied_valid, voice->rate, voice->stream_tag,
+		  voice->format, stream_valid, stream_valid ? stream : 0,
+		  format_valid, format_valid ? format : 0);
+}
+
+/* PM, prepare_mutex and output_mutex precede voice->mutex. */
+static int ae9_voice_live_locked(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	const struct ae9_voice_config *next = &spec->ae9_mode_voice;
+	const char *stage = "identity";
+	unsigned int stream = 0, format = 0;
+	bool stream_valid = false, format_valid = false;
+	bool wanted;
+	int err, detach;
+
+	lockdep_assert_held(&codec->bus->prepare_mutex);
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	guard(mutex)(&voice->mutex);
+	if (!READ_ONCE(spec->ae9_mode_active) || !voice->prepared ||
+	    voice->generation != spec->ae9_mode_voice_generation ||
+	    spec->in_enum_val != spec->ae9_mode_voice_source) {
+		err = -ECANCELED;
+		goto fail;
+	}
+	stage = "state";
+	if (voice->suspended || voice->source_dirty ||
+	    spec->dsp_state != DSP_DOWNLOADED) {
+		err = -EIO;
+		goto fail;
+	}
+	stage = "pcm";
+	if (voice->rate != 48000 || !voice->stream_tag ||
+	    (voice->format & (AC_FMT_BASE_44K | AC_FMT_MULT_MASK |
+			      AC_FMT_DIV_MASK))) {
+		err = -EINVAL;
+		goto fail;
+	}
+	wanted = ae9_voice_wanted(next, spec->in_enum_val);
+	if (wanted == voice->route) {
+		stage = "apply";
+		err = wanted ? ae9_voice_apply_locked(codec, next) : 0;
+		if (err < 0)
+			goto fail;
+		if (!err)
+			voice->desired = *next;
+		return err;
+	}
+	stage = "read-conv";
+	err = snd_hdac_read(&codec->core, spec->adcs[0], AC_VERB_GET_CONV,
+			    0, &stream);
+	if (err < 0)
+		goto fail;
+	stream_valid = true;
+	stage = "read-format";
+	err = snd_hdac_read(&codec->core, spec->adcs[0],
+			    AC_VERB_GET_STREAM_FORMAT, 0, &format);
+	if (err < 0)
+		goto fail;
+	format_valid = true;
+	stage = "mismatch";
+	if (stream > 0xff || (stream >> 4) != voice->stream_tag ||
+	    format != voice->format) {
+		err = -EIO;
+		goto fail;
+	}
+	/* Presets precede route-in; no SCP may follow it before the bind. */
+	stage = "apply";
+	err = ae9_voice_apply_locked(codec, next);
+	if (err < 0)
+		goto fail;
+	stage = "detach";
+	err = ae9_voice_bind(codec, 0);
+	if (err < 0)
+		goto uncertain;
+	/* 3xHelix v0.12.10 cv_apply: Windows' unbind-to-route interval. */
+	msleep(20);
+	stage = "route";
+	err = ae9_voice_route_locked(codec, wanted);
+	if (err < 0)
+		goto uncertain;
+	if (!wanted) {
+		/* route(false) is the stop sequence, still at 16 kHz/mode 1. */
+		stage = "raw";
+		err = ae9_voice_raw_locked(codec);
+		if (err < 0)
+			goto uncertain;
+	}
+	/* Explicit verb: setup_stream may skip the unchanged cached tag. */
+	stage = "rebind";
+	err = ae9_voice_bind(codec, stream);
+	if (err < 0)
+		goto uncertain;
+	voice->desired = *next;
+	return 0;
+uncertain:
+	/* Report the initial failure before defensive detach changes state. */
+	ae9_voice_live_error_locked(codec, stage, err, stream, stream_valid,
+				     format, format_valid);
+	/* Never bind an unknown route, or replay SCP behind its failure latch. */
+	detach = ae9_voice_bind(codec, 0);
+	ae9_voice_invalidate_input_locked(voice);
+	if (detach < 0)
+		codec_warn(codec, "AE-9: voice ADC detach failed: %d\n", detach);
+	return err;
+fail:
+	ae9_voice_live_error_locked(codec, stage, err, stream, stream_valid,
+				     format, format_valid);
+	return err;
+}
+
 static int ae9_voice_capture_open(struct hda_pcm_stream *hinfo,
 				  struct hda_codec *codec,
 				  struct snd_pcm_substream *substream)
@@ -9636,12 +10428,14 @@ static int ae9_voice_cleanup_locked(struct hda_pcm_stream *hinfo,
 	struct ae9_voice_state *voice = &spec->ae9_voice;
 	int err = 0;
 
+	voice->generation++;
 	if (!voice->prepared)
 		return 0;
 	snd_hda_codec_cleanup_stream(codec, hinfo->nid);
 	voice->prepared = false;
 	voice->rate = 0;
 	voice->format = 0;
+	voice->stream_tag = 0;
 	if (voice->suspended || spec->dsp_state != DSP_DOWNLOADED) {
 		voice->route = false;
 		voice->applied_valid = false;
@@ -9742,6 +10536,7 @@ static int ae9_voice_capture_prepare(struct hda_pcm_stream *hinfo,
 	voice->prepared = true;
 	voice->rate = substream->runtime->rate;
 	voice->format = format;
+	voice->stream_tag = stream_tag;
 	return 0;
 fail:
 	/* No ADC bind on failure. Keep the original error and invalidate cache. */
@@ -9767,6 +10562,7 @@ static int ae9_voice_capture_cleanup(struct hda_pcm_stream *hinfo,
 		voice->prepared = false;
 		voice->rate = 0;
 		voice->format = 0;
+		voice->stream_tag = 0;
 		ae9_voice_invalidate_input_locked(voice);
 		return pm.err;
 	}
@@ -9806,6 +10602,7 @@ static int ae9_voice_source_put(struct hda_codec *codec, unsigned int source)
 		return -EBUSY;
 	if (voice->suspended || spec->dsp_state != DSP_DOWNLOADED)
 		return -EIO;
+	voice->generation++;
 	old = spec->in_enum_val;
 	spec->in_enum_val = source;
 	/* This legacy source selection is allowed only with the ADC idle. */
@@ -9859,6 +10656,7 @@ static int ae9_voice_restore(struct hda_codec *codec)
 	int err = 0;
 
 	guard(mutex)(&voice->mutex);
+	voice->generation++;
 	voice->applied_valid = false;
 	voice->route = false;
 	voice->suspended = false;
@@ -9992,6 +10790,13 @@ static int ae9_voice_info(struct snd_kcontrol *kcontrol,
 	const char *names[ARRAY_SIZE(ca0132_voicefx_presets)];
 	unsigned int i, count;
 
+	if (kcontrol->private_value == AE9_VOICE_ERROR) {
+		uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+		uinfo->count = 1;
+		uinfo->value.integer.min = -MAX_ERRNO;
+		uinfo->value.integer.max = 0;
+		return 0;
+	}
 	if (kcontrol->private_value == AE9_VOICE_MICEQ) {
 		count = ARRAY_SIZE(ae9_miceq_presets);
 		for (i = 0; i < count; i++)
@@ -10012,7 +10817,16 @@ static int ae9_voice_get(struct snd_kcontrol *kcontrol,
 	struct ae9_voice_state *voice = &spec->ae9_voice;
 	unsigned int setting = kcontrol->private_value;
 	unsigned int value;
+	unsigned long flags;
 
+	if (setting == AE9_VOICE_PENDING || setting == AE9_VOICE_ERROR) {
+		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+		ucontrol->value.integer.value[0] = setting == AE9_VOICE_ERROR ?
+			spec->ae9_voice_error : spec->ae9_mode_pending &&
+			spec->ae9_mode_action == AE9_MODE_VOICE;
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		return 0;
+	}
 	guard(mutex)(&voice->mutex);
 	if (setting == AE9_VOICE_ACTIVE)
 		value = voice->prepared && voice->route &&
@@ -10078,6 +10892,24 @@ static const struct snd_kcontrol_new ae9_voice_controls[] = {
 		.info = ae9_voice_info,
 		.get = ae9_voice_get,
 		.private_value = AE9_VOICE_ACTIVE,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "AE-9: Voice Transition Pending",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ |
+			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = ae9_voice_info,
+		.get = ae9_voice_get,
+		.private_value = AE9_VOICE_PENDING,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "AE-9: Last Voice Error",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ |
+			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = ae9_voice_info,
+		.get = ae9_voice_get,
+		.private_value = AE9_VOICE_ERROR,
 	},
 	{ }
 };
@@ -10223,6 +11055,7 @@ static int ae9_direct_switch_locked(struct hda_codec *codec, bool enabled,
 	WRITE_ONCE(spec->ae9_acm_pending_fx, true);
 	return 1;
 fail:
+	ae9_dac_start_invalidate(spec);
 	/* Keep the requested mode and settings; a partial route stays silent. */
 	ae9_direct_mute(codec, true);
 	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
@@ -10396,13 +11229,35 @@ static int ae9_ctl_get(struct snd_kcontrol *kctl,
 		if (err >= 0)
 			err = ae9_ctl_copy_value(value, &proxy->values[index].value,
 						 &proxy->values[index].info[0]);
+		if (spec->ae9_mode_pending &&
+		    spec->ae9_mode_action == AE9_MODE_VOICE &&
+		    proxy->get == ae9_voice_get) {
+			unsigned int setting = kctl->private_value;
+
+			if (setting < AE9_VOICE_SETTING_COUNT) {
+				unsigned int requested;
+
+				requested = spec->ae9_mode_voice.value[setting];
+				if (setting == AE9_VOICE_MICEQ ||
+				    setting == AE9_VOICE_VOICEFX)
+					value->value.enumerated.item[0] = requested;
+				else
+					value->value.integer.value[0] = requested;
+				err = 0;
+			} else if (setting == AE9_VOICE_ACTIVE) {
+				value->value.integer.value[0] = 0;
+				err = 0;
+			}
+		}
 		if (spec->ae9_mode_pending) {
 			if (proxy->get == ae9_direct_get &&
-			    spec->ae9_mode_action != AE9_MODE_OUTFX) {
+			    spec->ae9_mode_action != AE9_MODE_OUTFX &&
+			    spec->ae9_mode_action != AE9_MODE_VOICE) {
 				value->value.integer.value[0] = spec->ae9_mode_requested;
 				err = 0;
 			} else if (proxy->outfx &&
-				   spec->ae9_mode_action != AE9_MODE_DIRECT) {
+				   spec->ae9_mode_action != AE9_MODE_DIRECT &&
+				   spec->ae9_mode_action != AE9_MODE_VOICE) {
 				value->value.integer.value[0] = spec->ae9_mode_fx_value;
 				err = 0;
 			}
@@ -10426,6 +11281,69 @@ out:
 
 static int ae9_mode_request(struct ca0132_spec *spec,
 			    enum ae9_mode_action action, bool value);
+static void ae9_mode_notify(struct hda_codec *codec, const char *name);
+
+/* The caller holds controls_rwsem; never wait for a route here. */
+static int ae9_voice_request(struct ca0132_spec *spec,
+			     unsigned int setting, unsigned int value)
+{
+	struct ae9_voice_state *voice = &spec->ae9_voice;
+	struct ae9_voice_config next;
+	unsigned long flags;
+	unsigned int limit;
+	int err = -EBUSY;
+
+	if (setting == AE9_VOICE_FOCUS)
+		return value ? -EOPNOTSUPP : 0;
+	if (setting >= AE9_VOICE_SETTING_COUNT)
+		return -EINVAL;
+	limit = setting == AE9_VOICE_MICEQ ? ARRAY_SIZE(ae9_miceq_presets) :
+		setting == AE9_VOICE_VOICEFX ? ARRAY_SIZE(ca0132_voicefx_presets) : 2;
+	if (value >= limit)
+		return -EINVAL;
+	if (!mutex_trylock(&voice->mutex))
+		return -EBUSY;
+	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+	if (!spec->ae9_mode_ready || !spec->ae9_mode_active ||
+	    spec->ae9_mode_removing || spec->ae9_mode_pending || spec->ae9_mode_users)
+		goto out;
+	next = voice->desired;
+	next.value[setting] = value;
+	/* Purely remembered raw settings keep their existing all-rate behavior. */
+	if (!voice->prepared ||
+	    (!voice->route && !ae9_voice_wanted(&next, spec->in_enum_val))) {
+		err = value != voice->desired.value[setting];
+		voice->desired = next;
+		goto out;
+	}
+	if (voice->rate != 48000 ||
+	    (voice->format & (AC_FMT_BASE_44K | AC_FMT_MULT_MASK |
+			      AC_FMT_DIV_MASK))) {
+		err = -EINVAL;
+		goto out;
+	}
+	if (voice->suspended || voice->source_dirty ||
+	    spec->dsp_state != DSP_DOWNLOADED) {
+		err = -EIO;
+		goto out;
+	}
+	if (value == voice->desired.value[setting] && voice->applied_valid) {
+		err = 0;
+		goto out;
+	}
+	spec->ae9_mode_voice = next;
+	spec->ae9_mode_voice_generation = voice->generation;
+	spec->ae9_mode_voice_source = spec->in_enum_val;
+	spec->ae9_mode_action = AE9_MODE_VOICE;
+	spec->ae9_mode_pending = true;
+	spec->ae9_mode_done = false;
+	mod_delayed_work(system_wq, &spec->ae9_mode_work, 0);
+	err = 1;
+out:
+	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+	mutex_unlock(&voice->mutex);
+	return err;
+}
 
 static int ae9_ctl_put(struct snd_kcontrol *kctl,
 			struct snd_ctl_elem_value *value)
@@ -10442,6 +11360,33 @@ static int ae9_ctl_put(struct snd_kcontrol *kctl,
 	index = ae9_ctl_index(kctl, &value->id);
 	if (index < 0) {
 		err = index;
+		goto out;
+	}
+	if (proxy->put == ae9_voice_put) {
+		unsigned int setting = kctl->private_value;
+		unsigned int requested;
+
+		if (setting == AE9_VOICE_MICEQ || setting == AE9_VOICE_VOICEFX) {
+			requested = value->value.enumerated.item[0];
+		} else if (value->value.integer.value[0] < 0 ||
+			 value->value.integer.value[0] > 1) {
+			err = -EINVAL;
+			goto out;
+		} else {
+			requested = value->value.integer.value[0];
+		}
+		err = ae9_voice_request(spec, setting, requested);
+		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
+		if (err >= 0 && !spec->ae9_mode_pending) {
+			proxy->values[index].value.value = value->value;
+			proxy->values[index].error = 0;
+		}
+		spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
+		if (err > 0) {
+			ae9_mode_notify(spec->codec, "AE-9: Voice Transition Pending");
+			ae9_mode_notify(spec->codec,
+					"Voice Clarity Active Capture Switch");
+		}
 		goto out;
 	}
 	if (proxy->outfx) {
@@ -10634,6 +11579,8 @@ static int ae9_mode_apply_locked(struct hda_codec *codec,
 
 	lockdep_assert_held(&codec->bus->prepare_mutex);
 	lockdep_assert_held(&spec->ae9_output_mutex);
+	if (action == AE9_MODE_VOICE)
+		return ae9_voice_live_locked(codec);
 	if (spec->dsp_state != DSP_DOWNLOADED)
 		return -EIO;
 	if (action == AE9_MODE_OUTFX && spec->ae9_direct.enabled)
@@ -10748,11 +11695,18 @@ static void ae9_mode_work_fn(struct work_struct *work)
 		CLASS(snd_hda_power_pm, pm)(codec);
 
 		err = ae9_pm_error(codec, pm.err);
+		if (err < 0 && action == AE9_MODE_VOICE)
+			codec_err(codec,
+				  "AE-9 voice failed: stage=pm err=%d\n", err);
 		powered = err >= 0;
 		spin_lock_irqsave(&spec->ae9_mode_lock, flags);
 		if (!spec->ae9_mode_active || !spec->ae9_mode_pending) {
-			if (err < 0)
-				spec->ae9_mode_error = err;
+			if (err < 0) {
+				if (action == AE9_MODE_VOICE)
+					spec->ae9_voice_error = err;
+				else
+					spec->ae9_mode_error = err;
+			}
 			spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
 			return;
 		}
@@ -10795,13 +11749,28 @@ static void ae9_mode_work_fn(struct work_struct *work)
 		return;
 	}
 	ae9_mode_cache_publish(spec);
-	spec->ae9_mode_error = min(spec->ae9_mode_result, 0);
+	if (spec->ae9_mode_action == AE9_MODE_VOICE)
+		spec->ae9_voice_error = min(spec->ae9_mode_result, 0);
+	else
+		spec->ae9_mode_error = min(spec->ae9_mode_result, 0);
 	spec->ae9_mode_pending = false;
 	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
 	ae9_direct_controls(codec, !READ_ONCE(spec->ae9_direct.enabled));
 	ae9_mode_notify(codec, "AE-9: Direct Mode Switch");
 	ae9_mode_notify(codec, "Enable OutFX Playback Switch");
 	ae9_mode_notify(codec, "AE-9: Last Mode Error");
+	if (action == AE9_MODE_VOICE) {
+		struct ae9_ctl_proxy *proxy;
+
+		list_for_each_entry(proxy, &spec->ae9_mode_controls, list) {
+			if (proxy->get == ae9_voice_get)
+				snd_ctl_notify_one(codec->card,
+						   SNDRV_CTL_EVENT_MASK_VALUE,
+						   proxy->kctl, 0);
+		}
+		ae9_mode_notify(codec, "AE-9: Voice Transition Pending");
+		ae9_mode_notify(codec, "AE-9: Last Voice Error");
+	}
 	up_write(&codec->card->controls_rwsem);
 }
 
@@ -10832,8 +11801,12 @@ static void ae9_mode_stop(struct ca0132_spec *spec, bool removing)
 	if (current_work() != &spec->ae9_mode_work.work)
 		cancel_delayed_work_sync(&spec->ae9_mode_work);
 	spin_lock_irqsave(&spec->ae9_mode_lock, flags);
-	if (spec->ae9_mode_pending)
-		spec->ae9_mode_error = -ECANCELED;
+	if (spec->ae9_mode_pending) {
+		if (spec->ae9_mode_action == AE9_MODE_VOICE)
+			spec->ae9_voice_error = -ECANCELED;
+		else
+			spec->ae9_mode_error = -ECANCELED;
+	}
 	spec->ae9_mode_pending = false;
 	spin_unlock_irqrestore(&spec->ae9_mode_lock, flags);
 }
@@ -10908,7 +11881,10 @@ static int ae9_mode_controls_build(struct hda_codec *codec)
 	/* Called once, after vmaster and all codec controls have been installed. */
 	for (n = 0; n < codec->mixers.used; n++) {
 		kctl = items[n].kctl;
-		if ((!kctl->get && !kctl->put) || kctl->get == ae9_mode_error_get)
+		if ((!kctl->get && !kctl->put) || kctl->get == ae9_mode_error_get ||
+		    (kctl->get == ae9_voice_get &&
+		     (kctl->private_value == AE9_VOICE_PENDING ||
+		      kctl->private_value == AE9_VOICE_ERROR)))
 			continue;
 		proxy = kzalloc(struct_size(proxy, values, kctl->count), GFP_KERNEL);
 		if (!proxy)
@@ -12693,6 +13669,7 @@ static int ae9_direct_reset_dsp(struct hda_codec *codec)
 	int err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
+	ae9_dac_start_invalidate(spec);
 	lockdep_assert_held(&spec->ae9_voice.mutex);
 	if (!direct->dsp_ref_held && !direct->dsp_ref_unknown)
 		return 0;
@@ -12759,8 +13736,10 @@ static int ae9_direct_mute(struct hda_codec *codec, bool mute)
 	/* A failed transport must not let a later volume request release mute. */
 	if (mute)
 		spec->ae9_dac_forced_mute = true;
-	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U)
+	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U) {
+		ae9_dac_start_invalidate(spec);
 		return -ENODEV;
+	}
 	value = (spec->ae9_dac_reg7 & ~1) |
 		(mute || spec->ae9_dac_user_muted);
 	/* No DAC acknowledgment: this remains a command cache. */
@@ -13059,16 +14038,21 @@ static int ae9_direct_prepare_locked(struct hda_codec *codec,
 	struct ca0132_spec *spec = codec->spec;
 	struct ae9_direct_state *direct = &spec->ae9_direct;
 	const struct ae9_direct_rate *params = ae9_direct_rate(rate);
+	u64 generation;
 	bool muted;
 	int err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
-	if (!params || !tag || tag > 15 || !ae9_direct_format(rate, format))
+	if (!params || !tag || tag > 15 || !ae9_direct_format(rate, format)) {
+		ae9_dac_start_invalidate(spec);
 		return -EINVAL;
+	}
 	guard(mutex)(&spec->ae9_voice.mutex);
 	err = ae9_direct_hold_dsp(codec);
-	if (err < 0)
+	if (err < 0) {
+		ae9_dac_start_invalidate(spec);
 		return err;
+	}
 	direct->valid = false;
 	direct->prepared = false;
 	if (!direct->touched) {
@@ -13081,8 +14065,7 @@ static int ae9_direct_prepare_locked(struct hda_codec *codec,
 	err = ae9_direct_mute(codec, true);
 	if (err < 0)
 		goto fail;
-	ae9_dac_write(codec, 0x01, 0xc0);
-	ae9_dac_write(codec, 0x0a, 0x02);
+	generation = ae9_dac_start_begin(codec, rate);
 	spec->ae9_direct.stage = "prepare:2:ae9_direct_program";
 	err = ae9_direct_program(codec, params, tag, format);
 	if (err < 0)
@@ -13100,8 +14083,10 @@ static int ae9_direct_prepare_locked(struct hda_codec *codec,
 	direct->rate = rate;
 	direct->valid = true;
 	direct->prepared = true;
+	ae9_dac_start_finish(spec, generation);
 	return 0;
 fail:
+	ae9_dac_start_invalidate(spec);
 	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
 	spec->ae9_output_applied = false;
 	spec->ae9_acm_pending_mode = false;
@@ -13170,6 +14155,7 @@ static int ae9_direct_restore_locked(struct hda_codec *codec)
 	int i, err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
+	ae9_dac_start_invalidate(spec);
 	guard(mutex)(&spec->ae9_voice.mutex);
 	direct->valid = false;
 	direct->prepared = false;
@@ -13391,7 +14377,7 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 	static const struct ae9_reg_val dac_init[] = {
 		{ 0x0b, 0x20 },
 		{ 0x04, 0x00 },
-		{ 0x06, 0x40 },
+		{ 0x06, 0x47 },	/* Experimental faster volume/soft-mute ramp. */
 		{ 0x08, 0xff },
 		{ 0x1d, 0x40 },
 		{ 0x0a, 0x06 },
@@ -13419,8 +14405,9 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 	unsigned int i;
 
 	/*
-	 * Replay captured writes rather than register read/modify/write cycles.
-	 * This assumes ES9038 defaults 0x0b=0x00, 0x0e=0x8a and 0x07=0x80.
+	 * Replay captured writes except R6[2:0], accelerated experimentally.
+	 * Use writes rather than register read/modify/write cycles, assuming
+	 * ES9038 defaults 0x0b=0x00, 0x0e=0x8a and 0x07=0x80.
 	 */
 	for (i = 0; i < ARRAY_SIZE(dac_init); i++)
 		ae9_dac_write(codec, dac_init[i].reg, dac_init[i].val);
@@ -13499,35 +14486,52 @@ static int ae9_validate_overlay(const struct firmware *fw)
 
 static int ae9_dsp_mc_set_state(struct hda_codec *codec, unsigned int state)
 {
-	unsigned int reply, reply_len;
-	int i, err;
+	unsigned int reply = 0, reply_len;
+	unsigned int polls = 0;
+	unsigned long deadline;
+	int err;
 
 	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &state,
 			sizeof(state), NULL, NULL);
 	if (err < 0)
 		return err;
-	for (i = 0; i < 2; i++) {
+	deadline = jiffies + msecs_to_jiffies(2000);
+	for (;;) {
+		if (!time_before(jiffies, deadline))
+			goto timeout;
 		reply_len = sizeof(reply);
 		reply = 0xdeadbeef;
 		err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET,
 				NULL, 0, &reply, &reply_len);
+		polls++;
 		if (err < 0)
 			return err;
 		if (reply_len != sizeof(reply))
 			return -EPROTO;
-		/* Replies are asynchronous; do not require reply == state. */
-		codec_info(codec, "AE-9: MC state %u GET%d -> %08x\n",
-			   state, i, reply);
+		if (!time_before(jiffies, deadline))
+			goto timeout;
+		if (reply == state) {
+			codec_info(codec, "AE-9: MC state %u reached after %u polls\n",
+				   state, polls);
+			return 0;
+		}
+		/* A valid reply can still describe the preceding boot state. */
+		msleep(min_t(unsigned int, state == 3 ? 105 : 20,
+			     jiffies_to_msecs(deadline - jiffies)));
 	}
 
-	return 0;
+timeout:
+	codec_err(codec,
+		  "AE-9: MC state %u timed out: last_valid=%u last=0x%08x polls=%u\n",
+		  state, polls != 0, reply, polls);
+	return -ETIMEDOUT;
 }
 
 /*
  * Captured MASTERCONTROL (source 0) startup states: 3, 4, 5, 0.
  * Load the external 432-byte output overlay between states 3 and 4
  * (2026-09-03, ops 2084-2196). It is Creative firmware, obtained separately.
- * GET replies are asynchronous: validate size, not equality to the SET.
+ * GET replies are asynchronous: wait for the requested state before proceeding.
  */
 static int ae9_dsp_scp_startup(struct hda_codec *codec)
 {
@@ -14661,25 +15665,32 @@ static void ae9_acm_service_buttons(struct hda_codec *codec)
 }
 
 /* Toggle a boolean/enum mixer control from the service and notify listeners. */
-static void ae9_toggle_ctl(struct hda_codec *codec, const char *name, bool is_enum)
+static int ae9_toggle_ctl(struct hda_codec *codec, const char *name,
+			  bool is_enum)
 {
 	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, name);
 	struct snd_ctl_elem_value *uctl;
+	int err;
 
-	if (!kctl || !kctl->get || !kctl->put)
-		return;
+	if (!kctl)
+		return -ENOENT;
+	if (!kctl->get || !kctl->put)
+		return -EOPNOTSUPP;
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
-		return;
-	if (kctl->get(kctl, uctl) >= 0) {
+		return -ENOMEM;
+	err = kctl->get(kctl, uctl);
+	if (err >= 0) {
 		if (is_enum)
 			uctl->value.enumerated.item[0] = !uctl->value.enumerated.item[0];
 		else
 			uctl->value.integer.value[0] = !uctl->value.integer.value[0];
-		kctl->put(kctl, uctl);
-		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+		err = kctl->put(kctl, uctl);
 	}
+	if (err > 0)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
 	kfree(uctl);
+	return err;
 }
 
 /*
@@ -14746,16 +15757,28 @@ static void ae9_acm_knob(struct hda_codec *codec)
 static void ae9_acm_apply_knob_press(struct hda_codec *codec, int ms)
 {
 	struct ca0132_spec *spec = codec->spec;
+	int err;
 
 	if (!ms)
 		return;
 	if (ms < 1500) {
-		ae9_toggle_ctl(codec, "Master Playback Switch", false);
-		codec_info(codec, "AE-9 ACM: knob press (%d ms) -> mute toggle\n", ms);
-		ae9_acm_display_changed(spec);
+		err = ae9_toggle_ctl(codec, "Master Playback Switch", false);
+		if (err < 0)
+			codec_warn(codec, "AE-9 ACM: mute toggle failed: %d\n",
+				   err);
+		else if (err > 0) {
+			codec_info(codec, "AE-9 ACM: knob press (%d ms) -> mute toggle\n",
+				   ms);
+			ae9_acm_display_changed(spec);
+		}
 	} else if (ms < 3000) {
-		ae9_toggle_ctl(codec, "AE-9 Output", true);	/* select_out flags pending_mode */
-		codec_info(codec, "AE-9 ACM: knob mid press (%d ms) -> output toggle\n", ms);
+		err = ae9_toggle_ctl(codec, "AE-9 Output", true);
+		if (err < 0)
+			codec_warn(codec, "AE-9 ACM: output toggle failed: %d\n",
+				   err);
+		else if (err > 0)
+			codec_info(codec, "AE-9 ACM: knob mid press (%d ms) -> output toggle\n",
+				   ms);
 	} else {
 		codec_info(codec, "AE-9 ACM: knob long press (%d ms), ignored\n", ms);
 	}
@@ -14783,6 +15806,10 @@ static int ae9_direct_output_locked(struct hda_codec *codec)
 	int err;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
+	scoped_guard(mutex, &spec->mem_mutex) {
+		if (spec->ae9_dac_start.output != spec->cur_out_type)
+			ae9_dac_start_dirty_locked(spec);
+	}
 	if (restore) {
 		scoped_guard(mutex, &spec->ae9_dac_mutex)
 			muted = spec->ae9_dac_forced_mute;
@@ -14811,6 +15838,7 @@ static int ae9_direct_output_locked(struct hda_codec *codec)
 	spec->ae9_acm_pending_mode = true;
 	return 0;
 fail:
+	ae9_dac_start_invalidate(spec);
 	__snd_hda_codec_cleanup_stream(codec, spec->dacs[0], 1);
 	spec->ae9_direct.valid = false;
 	spec->ae9_output_applied = false;
@@ -15647,6 +16675,11 @@ static void ca0132_process_dsp_response_locked(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		ae9_scp_drain_pending(codec);
+		return;
+	}
+
 	if (spec->wait_scp) {
 		if (dspio_get_response_data(codec) >= 0)
 			spec->wait_scp = 0;
@@ -15665,8 +16698,16 @@ static void ca0132_process_dsp_response(struct hda_codec *codec,
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		if (pm.err < 0)
 			return;
-		guard(mutex)(&spec->ae9_scp_mutex);
+		/* Jack polling passes res=0, not a DSP announcement. */
+		if (((callback->unsol_res >> 21) & 0x1f) != UNSOL_TAG_DSP)
+			return;
+		atomic_inc(&spec->ae9_scp_announced);
+		wake_up_all(&spec->ae9_scp_wait);
+		/* unsol_work must remain able to deliver later announcements. */
+		if (!mutex_trylock(&spec->ae9_scp_mutex))
+			return;
 		ca0132_process_dsp_response_locked(codec);
+		mutex_unlock(&spec->ae9_scp_mutex);
 		return;
 	}
 	ca0132_process_dsp_response_locked(codec);
@@ -16685,6 +17726,7 @@ static int ca0132_init(struct hda_codec *codec)
 	int i, err;
 	bool dsp_loaded;
 
+	ae9_dac_start_invalidate(spec);
 	if (ca0132_quirk(spec) == QUIRK_AE9 &&
 	    spec->dsp_state == DSP_DOWNLOAD_FAILED) {
 		ae9_output_invalidate(codec);
@@ -17247,6 +18289,8 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	mutex_init(&spec->ae9_output_mutex);
 	mutex_init(&spec->ae9_voice.mutex);
 	mutex_init(&spec->ae9_scp_mutex);
+	atomic_set(&spec->ae9_scp_announced, 0);
+	init_waitqueue_head(&spec->ae9_scp_wait);
 	spin_lock_init(&spec->ae9_acm_work_lock);
 	spin_lock_init(&spec->ae9_mode_lock);
 	INIT_LIST_HEAD(&spec->ae9_mode_controls);
@@ -17449,7 +18493,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.2.0-preview35-pcm-lock1");
+MODULE_VERSION("0.2.0-preview45-dac-ramp1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

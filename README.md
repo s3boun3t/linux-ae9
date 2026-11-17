@@ -6,28 +6,27 @@ SBX/CrystalVoice effects and desktop volume controls.
 
 ## What works?
 
-Status for **0.2.0-preview35-pcm-lock1**. Hardware reports come from one
-Linux Mint / XanMod reference system. Brief tests do not cover every setting
-or guarantee long-term stability.
+Status for **`0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a`** on one Linux Mint / XanMod
+reference system. This preview adds AE-9-specific DAC output presets and
+includes the DSP startup-state checks and bounded InFX status handling from
+the preceding `state1-a` candidate.
 
-| Feature | Status | Hardware testing |
-|---|---|---|
-| Stereo playback through ACM headphones | Working in reported tests | Both channels confirmed in brief listening tests |
-| Volume, mute and ACM knob | Working in reported tests | Brief tests in DSP and Direct modes |
-| SBX playback effects and ACM SBX button | Implemented; reported working | Selected effects tested; stereo playback and LED confirmed on return to SBX |
-| Microphone and CrystalVoice | Working in earlier tests | Brief recordings with NR, VoiceFX, Smart Volume, Mic EQ and AEC; not fully retested on preview35 |
-| ACM display and 3.5 mm jack detection | Implemented | Earlier observations and plug tests; not fully requalified on preview35 |
-| What U Hear playback capture | Working in earlier tests; DSP mode only | User recording confirmed on an earlier preview; not retested on preview35 |
-| Direct stereo playback at 48 / 96 / 192 kHz | Experimental | Headphone playback reported at 48 and 192 kHz; 96 kHz remains unqualified |
-| Live Direct ↔ DSP/SBX switching | Experimental; brief audible gap | Two short transitions at 48 kHz; 96/192 kHz and prolonged use remain unqualified |
-| Front RCA, surround and optical paths | Not fully qualified | No complete hardware validation |
-| Automatic ACM recovery after lost configuration | Implemented | Software tests only; real configuration loss not tested |
-| Suspend/resume and prolonged playback + recording | Not qualified | No complete hardware validation |
-| Direct at 44.1 / 88.2 / 176.4 / 384 kHz, multichannel, optical or DSD | Not supported | Outside the implemented Direct mode |
+| Feature | Hardware status |
+|---|---|
+| Startup sound, music, desktop volume and ACM knob | Reported working on this preview |
+| SBX ON/OFF during music playback | Reported working on this preview |
+| Microphone and InFX in Discord | Five successful switches reported on `state1-a`; audible capture has yet to be checked on this preview |
+| Direct stereo playback at 48 / 96 / 192 kHz | Experimental; headphone playback reported at 48 and 192 kHz on earlier previews; 96 kHz remains unqualified |
+| Live Direct ↔ DSP switching | Earlier brief tests at 48 kHz reported a short audible gap; broader testing is pending |
+| ACM display, 3.5 mm jack detection and What U Hear | Implemented and observed in earlier tests; further testing on this preview is pending |
+| Front RCA speakers, surround and optical | No complete hardware validation; the new speaker preset has yet to be tested |
+| ACM recovery after configuration loss, suspend/resume and prolonged duplex audio | Hardware validation pending |
+| Direct at 44.1 / 88.2 / 176.4 / 384 kHz, multichannel, optical or DSD | Outside the implemented Direct mode |
 
-Software checks and compilation have passed for this preview; they do not
-prove audio quality or hardware reliability. Other sound cards, including
-AE-5 and AE-7, are not qualified by this project.
+The software suite passed 36 groups and the three modules built together on
+the target kernel. The reference boot reached the expected DSP states
+`3 → 4 → 5 → 0`. Other sound cards, including AE-5 and AE-7, remain
+unqualified by this project.
 
 ## Install
 
@@ -80,8 +79,8 @@ keep the previous working version until the new version has built successfully.
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview35-pcm-lock1 -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview35-pcm-lock1 -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$target_kernel"
 ```
 
 If this exact version is already registered, skip `dkms add .`.
@@ -120,8 +119,8 @@ enabling it. Start at low volume when comparing DSP and Direct modes.
 - Direct mode does not guarantee bit-perfect output: applications or
   PipeWire may resample. A negotiated rate is not a measurement of the DAC clock.
 - DSP mode accepts a 192 kHz stream, but its internal route remains at 96 kHz.
-- A startup HDA response timeout for `0x10720011` still occurs on the
-  reference system, followed by polling fallback. It is not resolved.
+- The reference boot logged an HDA timeout on command `0x11602095` and
+  switched to polling. Earlier previews also logged a startup HDA timeout.
 
 For an issue, include your kernel, driver version, affected connection and
 these outputs, after checking them for personal information:
@@ -140,7 +139,7 @@ following older installation or compatibility instructions.
 To remove this version from the running kernel:
 
 ```sh
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview35-pcm-lock1 -k "$(uname -r)"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$(uname -r)"
 ```
 
 Refresh the boot image if needed, then reboot. An earlier manual installation
