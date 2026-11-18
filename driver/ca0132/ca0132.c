@@ -4916,8 +4916,8 @@ static void ae9_dac_start_command_locked(struct ca0132_spec *spec,
  * BAR2 offset 0x320 selects a GPIO with bits 3:0 and its level with bit 8.
  * On AE-5, pins 2 and 3 appear to carry LED data and its strobe.
  */
-static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
-		bool enable)
+static int ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
+				bool enable)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned short gpio_data;
@@ -4935,12 +4935,14 @@ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
 		if (ca0113_mmio_writew(spec, 0x320, gpio_data) == 0xffff) {
 			ae9_dac_start_dirty_locked(spec);
 			spec->ae9_dac_start.gpio5_high = false;
-		} else if (gpio_pin == 5) {
-			spec->ae9_dac_start.gpio5_high = enable;
+			return -ENODEV;
 		}
-		return;
+		if (gpio_pin == 5)
+			spec->ae9_dac_start.gpio5_high = enable;
+		return 0;
 	}
 	ca0113_mmio_writew(spec, 0x320, gpio_data);
+	return 0;
 }
 
 /*
@@ -14348,26 +14350,41 @@ static void ae9_dev49_write(struct hda_codec *codec, unsigned int reg, unsigned 
 	ca0113_mmio_command_set(codec, 0x49, reg, val);
 }
 
-/* Prepare GPIOs and mute the DACs before clock setup. */
-static void ae9_post_dsp_d0_prepare(struct hda_codec *codec)
+/*
+ * Reset the DACs before loading the DSP. The post-DSP replay reasserts
+ * the GPIO and mute settings with GPIO0 still high.
+ */
+static int ae9_board_d0_prepare(struct hda_codec *codec, bool reset_dacs)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int v;
+	int err;
 
 	v = readl(spec->mem_base + 0x100);
+	if (v == ~0U)
+		return -ENODEV;
 	ca0113_mmio_writel(spec, 0x100, v & ~0x0f);	/* Preserve bits 31:4. */
 	ca0113_mmio_writel(spec, 0x304, 0xff);
 	/* GPIO 5 = 1: ACM 12 V / external enable */
-	ca0113_mmio_gpio_set(codec, 5, true);
-	/* Keep the captured pin-0 pulse before DAC setup. */
-	ca0113_mmio_gpio_set(codec, 0, false);
-	msleep(1);
-	ca0113_mmio_gpio_set(codec, 0, true);
+	err = ca0113_mmio_gpio_set(codec, 5, true);
+	if (err < 0)
+		return err;
+	if (reset_dacs) {
+		err = ca0113_mmio_gpio_set(codec, 0, false);
+		if (err < 0)
+			return err;
+		usleep_range(16000, 17000);
+		err = ca0113_mmio_gpio_set(codec, 0, true);
+		if (err < 0)
+			return err;
+	}
 	ae9_dac_write(codec, 0x07, 0x81);	/* ES9038: mute */
 	ae9_dev49_write(codec, 0x0a, 0x07);
-	ca0113_mmio_gpio_set(codec, 2, false);		/* pin 2 = 0 */
-	ae9_dac_write(codec, 0x1d, 0x40);	/* front unmute state */
-	ca0113_mmio_gpio_set(codec, 3, true);		/* pin 3 = 1 */
+	err = ca0113_mmio_gpio_set(codec, 2, false);
+	if (err < 0)
+		return err;
+	ae9_dac_write(codec, 0x1d, 0x40);	/* ES9038 GPIO polarity */
+	return ca0113_mmio_gpio_set(codec, 3, true);
 }
 
 static void ae9_chip_ctrl_725(struct hda_codec *codec)
@@ -16574,7 +16591,7 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 
 	/*
 	 * Preserve captured startup order: MASTERCONTROL/overlay, defaults,
-	 * GPIO/ASI/PLL, output connection, then DAC setup. First-stream
+	 * GPIO replay/ASI/PLL, output connection, then DAC setup. First-stream
 	 * latching remains an unverified explanation for this order.
 	 */
 	err = ae9_dsp_scp_startup(codec);
@@ -16586,7 +16603,10 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	err = ae9_dsp_defaults(codec);
 	if (err < 0)
 		goto fail;
-	ae9_post_dsp_d0_prepare(codec);		/* Pins, ACM power, DAC mute. */
+	stage = "board D0 replay";
+	err = ae9_board_d0_prepare(codec, false);
+	if (err < 0)
+		goto fail;
 	ae9_post_dsp_asi_pll_setup(codec);	/* ASI/PLL, then streams. */
 	stage = "output connection";
 	err = ae9_dsp_output_connect(codec);
@@ -17767,7 +17787,7 @@ static void ae5_register_set(struct hda_codec *codec)
 	chipio_8051_write_direct(codec, 0x90, 0x00);
 	chipio_8051_write_direct(codec, 0x90, 0x10);
 
-	if ((ca0132_quirk(spec) == QUIRK_AE5 || ca0132_quirk(spec) == QUIRK_AE9))
+	if (ca0132_quirk(spec) == QUIRK_AE5)
 		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x83);
 }
 
@@ -17883,7 +17903,8 @@ static void ca0132_alt_init(struct hda_codec *codec)
 	}
 }
 
-static int ae9_dsp_init_failed(struct hda_codec *codec, int err)
+static int ae9_dsp_init_failed(struct hda_codec *codec, int err,
+			       bool board_started)
 {
 	struct ca0132_spec *spec = codec->spec;
 
@@ -17892,9 +17913,23 @@ static int ae9_dsp_init_failed(struct hda_codec *codec, int err)
 	spec->dsp_state = DSP_DOWNLOAD_FAILED;
 	spec->ae9_dsp_vol_zeroed = false;
 	ae9_acm_stop(spec, false);
+	if (board_started)
+		WRITE_ONCE(spec->ae9_acm_present, false);
+	if (readl(spec->mem_base + 0x210) == ~0U)
+		goto report;
+
 	/* Best effort: the DAC command API has no acknowledgment. */
 	ae9_dac_write(codec, 0x07, 0x81);
 	ae9_dev49_write(codec, 0x0a, 0x07);
+	if (board_started) {
+		/* Follow power-down GPIO order even if the DSP is unavailable. */
+		ca0113_mmio_gpio_set(codec, 4, false);
+		ca0113_mmio_gpio_set(codec, 5, false);
+		ca0113_mmio_gpio_set(codec, 3, false);
+		ca0113_mmio_gpio_set(codec, 0, false);
+	}
+
+report:
 	codec_err(codec, "AE-9: DSP initialization failed: %d\n", err);
 	return err;
 }
@@ -17904,13 +17939,17 @@ static int ca0132_init(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 	struct auto_pin_cfg *cfg = &spec->autocfg;
 	int i, err;
+	bool board_started = false;
 	bool dsp_loaded;
 
 	ae9_dac_start_invalidate(spec);
-	if (ca0132_quirk(spec) == QUIRK_AE9 &&
-	    spec->dsp_state == DSP_DOWNLOAD_FAILED) {
-		ae9_output_invalidate(codec);
-		return -EIO;
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		if (!spec->mem_base)
+			return -ENODEV;
+		if (spec->dsp_state == DSP_DOWNLOAD_FAILED) {
+			ae9_output_invalidate(codec);
+			return -EIO;
+		}
 	}
 
 	/*
@@ -17921,6 +17960,12 @@ static int ca0132_init(struct hda_codec *codec)
 	if (spec->dsp_state == DSP_DOWNLOADED) {
 		dsp_loaded = dspload_is_loaded(codec);
 		if (!dsp_loaded) {
+			if (ca0132_quirk(spec) == QUIRK_AE9) {
+				ae9_acm_stop(spec, false);
+				/* Re-detect the ACM after restoring the routes. */
+				scoped_guard(mutex, &spec->ae9_output_mutex)
+					WRITE_ONCE(spec->ae9_acm_present, false);
+			}
 			spec->dsp_reload = true;
 			spec->dsp_state = DSP_DOWNLOAD_INIT;
 		} else {
@@ -17937,7 +17982,7 @@ static int ca0132_init(struct hda_codec *codec)
 				}
 				err = ae9_resume_routes(codec);
 				if (err < 0)
-					return ae9_dsp_init_failed(codec, err);
+					return ae9_dsp_init_failed(codec, err, false);
 				ae9_acm_start(spec, msecs_to_jiffies(500));
 			}
 			return 0;
@@ -17969,6 +18014,14 @@ static int ca0132_init(struct hda_codec *codec)
 	    ca0132_quirk(spec) == QUIRK_AE7)
 		ae5_register_set(codec);
 
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    IS_ENABLED(CONFIG_SND_HDA_CODEC_CA0132_DSP)) {
+		board_started = true;
+		err = ae9_board_d0_prepare(codec, true);
+		if (err < 0)
+			goto ae9_failed;
+	}
+
 	ca0132_init_params(codec);
 	ca0132_init_flags(codec);
 
@@ -17996,7 +18049,7 @@ static int ca0132_init(struct hda_codec *codec)
 	case QUIRK_AE9:
 		err = ae9_setup_defaults(codec);
 		if (err < 0)
-			return ae9_dsp_init_failed(codec, err);
+			goto ae9_failed;
 		break;
 	case QUIRK_AE7:
 		ae7_setup_defaults(codec);
@@ -18028,7 +18081,7 @@ static int ca0132_init(struct hda_codec *codec)
 		scoped_guard(mutex, &spec->ae9_output_mutex)
 			err = ae9_hda_volume_unity(codec);
 		if (err < 0)
-			return ae9_dsp_init_failed(codec, err);
+			goto ae9_failed;
 	}
 
 	if (!ca0132_use_alt_functions(spec)) {
@@ -18046,11 +18099,11 @@ static int ca0132_init(struct hda_codec *codec)
 	if (ca0132_use_alt_functions(spec)) {
 		err = ca0132_alt_select_out(codec);
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
-			return ae9_dsp_init_failed(codec, err);
+			goto ae9_failed;
 		if (ca0132_quirk(spec) == QUIRK_AE9) {
 			err = ae9_voice_restore(codec);
 			if (err < 0)
-				return ae9_dsp_init_failed(codec, err);
+				goto ae9_failed;
 		} else {
 			ca0132_alt_select_in(codec);
 		}
@@ -18066,13 +18119,16 @@ static int ca0132_init(struct hda_codec *codec)
 		spec->dsp_reload = false;
 		err = ca0132_pe_switch_set(codec);
 		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
-			return ae9_dsp_init_failed(codec, err);
+			goto ae9_failed;
 	}
 
 	if (ca0132_quirk(spec) == QUIRK_AE9)
 		ae9_acm_start(spec, msecs_to_jiffies(500));
 
 	return 0;
+
+ae9_failed:
+	return ae9_dsp_init_failed(codec, err, board_started);
 }
 
 static int dbpro_init(struct hda_codec *codec)
