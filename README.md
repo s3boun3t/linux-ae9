@@ -6,19 +6,19 @@ SBX/CrystalVoice effects and desktop volume controls.
 
 ## What works?
 
-Status for **`0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a`** on one Linux Mint / XanMod
-reference system. This preview adds AE-9-specific DAC output presets and
-includes the DSP startup-state checks and bounded InFX status handling from
-the preceding `state1-a` candidate.
+Status for **`0.2.0-preview45-dac-ramp1-native-hda-board-d0-stream05-micraw1-dacdiag0-acmvol1-a`** on one Linux Mint / XanMod reference system. This preview adds headphone-only gain compensation, a single DAC reset
+before DSP load, raw microphone defaults and mixer-relative ACM volume. The
+driver no longer forces stream 0x05 on at startup. The DAC startup dump is
+disabled by default and can be enabled with `snd_hda_codec_ca0132.ae9_dac_diag=1`.
 
 | Feature | Hardware status |
 |---|---|
-| Startup sound, music, desktop volume and ACM knob | Reported working on this preview |
-| SBX ON/OFF during music playback | Reported working on this preview |
-| Microphone and InFX in Discord | Five successful switches reported on `state1-a`; audible capture has yet to be checked on this preview |
+| ACM knob and display | Confirmed after reboot on this preview. The display shows 0.0 at maximum with the reference headset |
+| Stereo playback and SBX ON/OFF | Reported working on earlier candidates in this series |
+| Microphone and InFX in Discord | Input activity confirmed with InFX off and on using the preceding `micraw1` candidate |
 | Direct stereo playback at 48 / 96 / 192 kHz | Experimental; headphone playback reported at 48 and 192 kHz on earlier previews; 96 kHz remains unqualified |
-| Live Direct ↔ DSP switching | Earlier brief tests at 48 kHz reported a short audible gap; broader testing is pending |
-| ACM display, 3.5 mm jack detection and What U Hear | Implemented and observed in earlier tests; further testing on this preview is pending |
+| Live Direct ↔ DSP switching | Worked in brief user tests, including at 192 kHz on `stream05`. Broader testing is pending |
+| 3.5 mm jack detection and What U Hear | Implemented and observed in earlier tests; further testing on this preview is pending |
 | Front RCA speakers, surround and optical | No complete hardware validation; the new speaker preset has yet to be tested |
 | ACM recovery after configuration loss, suspend/resume and prolonged duplex audio | Hardware validation pending |
 | Direct at 44.1 / 88.2 / 176.4 / 384 kHz, multichannel, optical or DSD | Outside the implemented Direct mode |
@@ -79,8 +79,8 @@ keep the previous working version until the new version has built successfully.
 ```sh
 target_kernel="$(uname -r)"
 sudo dkms add .
-sudo dkms build -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$target_kernel"
-sudo dkms install -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$target_kernel"
+sudo dkms build -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-board-d0-stream05-micraw1-dacdiag0-acmvol1-a -k "$target_kernel"
+sudo dkms install -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-board-d0-stream05-micraw1-dacdiag0-acmvol1-a -k "$target_kernel"
 ```
 
 If this exact version is already registered, skip `dkms add .`.
@@ -119,8 +119,10 @@ enabling it. Start at low volume when comparing DSP and Direct modes.
 - Direct mode does not guarantee bit-perfect output: applications or
   PipeWire may resample. A negotiated rate is not a measurement of the DAC clock.
 - DSP mode accepts a 192 kHz stream, but its internal route remains at 96 kHz.
-- The reference boot logged an HDA timeout on command `0x11602095` and
-  switched to polling. Earlier previews also logged a startup HDA timeout.
+- Startup HDA timeouts with fallback to polling have been observed, including
+  on command `0x10720011` in recent candidates.
+- An earlier D0 cold boot had microphone and SBX failures. Later boots worked,
+  and the cause of the earlier failure remains open.
 
 For an issue, include your kernel, driver version, affected connection and
 these outputs, after checking them for personal information:
@@ -139,7 +141,7 @@ following older installation or compatibility instructions.
 To remove this version from the running kernel:
 
 ```sh
-sudo dkms remove -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-output-presets1-a -k "$(uname -r)"
+sudo dkms remove -m sb-ae9 -v 0.2.0-preview45-dac-ramp1-native-hda-board-d0-stream05-micraw1-dacdiag0-acmvol1-a -k "$(uname -r)"
 ```
 
 Refresh the boot image if needed, then reboot. An earlier manual installation
