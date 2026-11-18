@@ -7003,7 +7003,7 @@ static int ae9_input_vipsource(struct hda_codec *codec, int val)
 		tmp = spec->effects_switch[VOICE_FOCUS - EFFECT_START_NID] ?
 			FLOAT_TWO : FLOAT_ONE;
 	else
-		tmp = spec->in_enum_val == REAR_LINE_IN ? FLOAT_ZERO : FLOAT_ONE;
+		tmp = spec->in_enum_val == REAR_LINE_IN ? FLOAT_ZERO : FLOAT_THREE;
 	err = dspio_set_uint_param(codec, 0x80, 0x00, tmp);
 	if (err < 0)
 		return err;
@@ -14767,7 +14767,7 @@ static int ae9_dsp_defaults(struct hda_codec *codec)
 		return err;
 	chipio_set_conn_rate(codec, MEM_CONNID_MICIN2, SR_96_000);
 	chipio_set_conn_rate(codec, MEM_CONNID_MICOUT2, SR_96_000);
-	err = dspio_set_uint_param(codec, 0x80, 0x01, FLOAT_THREE);
+	err = dspio_set_uint_param(codec, 0x80, 0x01, FLOAT_ZERO);
 	if (err < 0)
 		return err;
 
