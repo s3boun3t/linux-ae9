@@ -14454,7 +14454,6 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 	msleep(75);
 	chipio_set_stream_source_dest(codec, 0x05, 0x43, 0x00);
 	chipio_set_stream_channels(codec, 0x05, 2);	/* stereo HDA-input stream */
-	chipio_set_stream_control(codec, 0x05, 1);
 	msleep(75);
 	chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd0);
 	chipio_set_conn_rate(codec, 0xd0, SR_96_000);
