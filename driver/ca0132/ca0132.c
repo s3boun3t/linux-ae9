@@ -5086,18 +5086,6 @@ static unsigned int ca0113_mmio_read_locked(struct hda_codec *codec,
 	return val;
 }
 
-static unsigned int ca0113_mmio_command_get(struct hda_codec *codec,
-					    unsigned int group, unsigned int reg)
-{
-	struct ca0132_spec *spec = codec->spec;
-
-	if (!spec->mem_base)
-		return 0xffffffff;
-	guard(mutex)(&spec->mem_mutex);
-	return ca0113_mmio_read_locked(codec, group, reg) & 0xff;
-}
-
-/* Opt-in only: retain the existing bring-up transactions by default. */
 static bool ae9_dac_diag;
 module_param(ae9_dac_diag, bool, 0444);
 MODULE_PARM_DESC(ae9_dac_diag,
@@ -14871,6 +14859,9 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 				   xr[i].name, v);
 		}
 	}
+	if (!ae9_dac_diag)
+		return;
+
 	/*
 	 * CA0113 DAC readback; reply freshness remains unverified.
 	 */
@@ -14897,16 +14888,6 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 			struct ae9_dac_readback result;
 			int err;
 
-			if (!ae9_dac_diag) {
-				unsigned int value;
-
-				value = ca0113_mmio_command_get(codec,
-								dr[i].grp, dr[i].reg);
-				codec_info(codec,
-					   "AE-9 DSP-STATE   %-34s = %08x\n",
-					   dr[i].name, value);
-				continue;
-			}
 			if (!ae9_dac_diag_reg_allowed(dr[i].grp, dr[i].reg)) {
 				codec_info(codec,
 					   "AE-9 DAC-DIAG %02x/%02x skipped: status read side effects\n",
