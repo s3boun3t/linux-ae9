@@ -1405,6 +1405,10 @@ struct ca0132_spec {
 	u8 ae9_dac_volume[2];
 	bool ae9_dac_user_muted;
 	bool ae9_dac_forced_mute;
+	/* Output mutex owns the confirmed route; DAC mutex also guards mute. */
+	bool ae9_hp_amp_on, ae9_hp_amp_valid;
+	unsigned int ae9_output_generation;
+	bool ae9_output_muted;
 	/* ZxR Control Values */
 	unsigned char zxr_gain_set;
 
@@ -1580,6 +1584,9 @@ static bool ae9_direct_format(unsigned int rate, unsigned int format);
 static int ae9_direct_bind(struct hda_codec *codec, unsigned int tag,
 			   unsigned int format);
 static int ae9_direct_mute(struct hda_codec *codec, bool mute);
+static int ae9_dac_output_mute(struct hda_codec *codec, bool mute);
+static int ae9_dac_volume_restore_locked(struct hda_codec *codec,
+					 bool apply_pending);
 static int ae9_direct_output_locked(struct hda_codec *codec);
 static int __ca0132_alt_select_out(struct hda_codec *codec);
 static void ae9_direct_controls(struct hda_codec *codec, bool active);
@@ -5479,6 +5486,12 @@ static void ae9_output_invalidate(struct hda_codec *codec)
 	if (ca0132_quirk(spec) != QUIRK_AE9)
 		return;
 	guard(mutex)(&spec->ae9_output_mutex);
+	spec->ae9_hp_amp_valid = false;
+	/* A new codec/ACM session must confirm an existing headphone route. */
+	if (spec->ae9_hp_amp_on || spec->cur_out_type == HEADPHONE_OUT) {
+		guard(mutex)(&spec->ae9_dac_mutex);
+		spec->ae9_output_muted = true;
+	}
 	ae9_dac_start_invalidate(spec);
 	spec->ae9_output_applied = false;
 	spec->ae9_direct.valid = false;
@@ -6436,7 +6449,8 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 			return err;
 	}
 
-	if (quirk_data->has_headphone_gain) {
+	if (quirk_data->has_headphone_gain &&
+	    ca0132_quirk(spec) != QUIRK_AE9) {
 		if (spec->cur_out_type != HEADPHONE_OUT) {
 			if (quirk_data->is_ae_series)
 				ae5_headphone_gain_set(codec, 2);
@@ -6500,17 +6514,18 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp, outfx_set;
 	int jack_present;
-	int auto_jack;
+	int auto_jack, output;
 	int err;
 	/* Default Headphone is rear headphone */
 	hda_nid_t headphone_nid = spec->out_pins[1];
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		lockdep_assert_held(&spec->ae9_output_mutex);
-		spec->ae9_output_applied = false;
-		spec->ae9_acm_pending_mode = false;
-		if (spec->dsp_state != DSP_DOWNLOADED)
+		if (spec->dsp_state != DSP_DOWNLOADED) {
+			spec->ae9_output_applied = false;
+			spec->ae9_acm_pending_mode = false;
 			return -EIO;
+		}
 	}
 
 	codec_dbg(codec, "%s\n", __func__);
@@ -6518,8 +6533,11 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	CLASS(snd_hda_power_pm, pm)(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		err = ae9_pm_error(codec, pm.err);
-		if (err < 0)
+		if (err < 0) {
+			spec->ae9_output_applied = false;
+			spec->ae9_acm_pending_mode = false;
 			return err;
+		}
 	}
 
 	auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
@@ -6534,12 +6552,35 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 			   snd_hda_jack_detect(codec, spec->unsol_tag_front_hp);
 
 		if (jack_present)
-			spec->cur_out_type = HEADPHONE_OUT;
+			output = HEADPHONE_OUT;
 		else
-			spec->cur_out_type = SPEAKER_OUT;
+			output = SPEAKER_OUT;
 	} else
-		spec->cur_out_type = spec->out_enum_val;
+		output = spec->out_enum_val;
 	outfx_set = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		bool hp = output == HEADPHONE_OUT;
+		bool switching = spec->ae9_output_muted ||
+				 hp != spec->ae9_hp_amp_on;
+
+		/* Initial setup can confirm a route before the worker parks. */
+		if (switching && READ_ONCE(spec->ae9_acm_present) &&
+		    (!READ_ONCE(ae9_acm_poll) ||
+		     !READ_ONCE(spec->ae9_acm_active)))
+			return -EOPNOTSUPP;
+		if (switching && READ_ONCE(spec->ae9_acm_tx_failed))
+			return -EIO;
+		spec->ae9_output_generation++;
+		spec->ae9_output_applied = false;
+		spec->ae9_acm_pending_mode = false;
+		if (switching) {
+			err = ae9_dac_output_mute(codec, true);
+			if (err < 0)
+				return err;
+		}
+	}
+	spec->cur_out_type = output;
 
 	if (ca0132_quirk(spec) == QUIRK_AE9 && spec->ae9_direct.enabled)
 		return ae9_direct_output_locked(codec);
@@ -8013,19 +8054,26 @@ static int ae5_headphone_gain_put(struct snd_kcontrol *kcontrol,
 		return ca0132_quirk(spec) == QUIRK_AE9 ? -EINVAL : 0;
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		int err;
+		int old, err;
 
 		CLASS(snd_hda_power_pm, pm)(codec);
 		err = ae9_pm_error(codec, pm.err);
 		if (err < 0)
 			return err;
-		/* The jack worker holds this across its route and gain writes. */
+		/* Keep the saved ALSA preset; only the headphone volume uses it. */
 		guard(mutex)(&spec->ae9_output_mutex);
 		if (spec->ae5_headphone_gain_val == sel)
 			return 0;
+		old = spec->ae5_headphone_gain_val;
 		spec->ae5_headphone_gain_val = sel;
-		if (spec->out_enum_val == HEADPHONE_OUT)
-			ae5_headphone_gain_set(codec, sel);
+		if (spec->cur_out_type == HEADPHONE_OUT) {
+			err = ae9_dac_volume_restore_locked(codec, false);
+			if (err < 0) {
+				spec->ae5_headphone_gain_val = old;
+				return err;
+			}
+			ae9_acm_display_changed(spec);
+		}
 		return 1;
 	}
 
@@ -8275,7 +8323,8 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 
 		mutex_lock(&spec->ae9_output_mutex);
 		auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
-		if (!auto_jack || !spec->ae9_output_applied)
+		if (!auto_jack || !spec->ae9_output_applied ||
+		    spec->ae9_output_muted)
 			err = ae9_select_output_locked(codec, sel);
 		else
 			spec->out_enum_val = sel;
@@ -8874,8 +8923,11 @@ static int ae9_dac_attenuation(unsigned int caps, long level)
 
 /* Output mutex owns logical levels; DAC mutex serializes both channels. */
 static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
-				bool left_on, bool right_on, bool fast)
+				bool left_on, bool right_on, bool fast,
+				bool apply_pending)
 {
+	/* Low/Medium/High retain their legacy 8/4.5/0 dB attenuation. */
+	static const u8 hp_steps[] = { 16, 9, 0 };
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
 	bool muted;
@@ -8891,6 +8943,12 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 		return rval;
 	left_on &= left || !(caps & AC_AMPCAP_MIN_MUTE);
 	right_on &= right || !(caps & AC_AMPCAP_MIN_MUTE);
+	if (spec->cur_out_type == HEADPHONE_OUT) {
+		u8 steps = hp_steps[spec->ae5_headphone_gain_val];
+
+		lval = min(lval + steps, 0xff);
+		rval = min(rval + steps, 0xff);
+	}
 	if (!left_on)
 		lval = 0xff;
 	if (!right_on)
@@ -8902,11 +8960,16 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 		ae9_dac_start_invalidate(spec);
 		return -ENODEV;
 	}
+	/* Stage logical changes until the ACM confirms the target output. */
+	if (spec->ae9_output_muted && !apply_pending) {
+		spec->ae9_dac_user_muted = muted;
+		return 0;
+	}
 	/* ESS digital volume is unavailable with the oversampling bypassed. */
 	if (spec->ae9_dac_reg7 & BIT(1))
 		return -EOPNOTSUPP;
 	reg7 = (spec->ae9_dac_reg7 & ~1) |
-		(spec->ae9_dac_forced_mute || muted);
+		(spec->ae9_dac_forced_mute || spec->ae9_output_muted || muted);
 	/* Assert mute before changing levels; release it only after both writes. */
 	if ((reg7 & 1) && reg7 != spec->ae9_dac_reg7)
 		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
@@ -8921,14 +8984,15 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 	return 0;
 }
 
-static int ae9_dac_volume_restore_locked(struct hda_codec *codec)
+static int ae9_dac_volume_restore_locked(struct hda_codec *codec,
+					 bool apply_pending)
 {
 	struct ca0132_spec *spec = codec->spec;
 	int idx = VNID_SPK - VNODE_START_NID;
 
 	return ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
 				    spec->vnode_rvol[idx], spec->vnode_lswitch[idx],
-				    spec->vnode_rswitch[idx], false);
+				    spec->vnode_rswitch[idx], false, apply_pending);
 }
 
 /* HDA/DSP must not add a second attenuation to the common DAC volume. */
@@ -8991,7 +9055,7 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	if (ch & 2)
 		right = *valp;
 	err = ae9_dac_volume_apply(codec, left, right, spec->vnode_lswitch[idx],
-				   spec->vnode_rswitch[idx], true);
+				   spec->vnode_rswitch[idx], true, false);
 	if (err < 0)
 		return err;
 	changed = left != spec->vnode_lvol[idx] || right != spec->vnode_rvol[idx];
@@ -9043,7 +9107,7 @@ static int ae9_master_switch_put(struct snd_kcontrol *kcontrol,
 	if (left < 0 || left > 1 || right < 0 || right > 1)
 		return -EINVAL;
 	err = ae9_dac_volume_apply(codec, spec->vnode_lvol[idx],
-				   spec->vnode_rvol[idx], left, right, false);
+				   spec->vnode_rvol[idx], left, right, false, false);
 	if (err < 0)
 		return err;
 	changed = left != spec->vnode_lswitch[idx] || right != spec->vnode_rswitch[idx];
@@ -10766,7 +10830,7 @@ static int ae9_resume_routes(struct hda_codec *codec)
 	int err;
 
 	scoped_guard(mutex, &spec->ae9_output_mutex) {
-		err = ae9_dac_volume_restore_locked(codec);
+		err = ae9_dac_volume_restore_locked(codec, false);
 		if (err < 0)
 			return err;
 		err = ae9_hda_volume_unity(codec);
@@ -13377,7 +13441,7 @@ static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned in
 	val = (val & ~AE9_DAC_FILTER_MASK) |
 		(spec->ae9_dac_reg7 & AE9_DAC_FILTER_MASK);
 	spec->ae9_dac_forced_mute = val & 1;
-	val |= spec->ae9_dac_user_muted;
+	val |= spec->ae9_dac_user_muted || spec->ae9_output_muted;
 	ca0113_mmio_command_set(codec, 0x48, reg, val);
 	spec->ae9_dac_reg7 = val;
 }
@@ -13727,15 +13791,12 @@ static int ae9_direct_clock(struct hda_codec *codec,
 	return chipio_write(codec, 0x189028, 0x0002000f);
 }
 
-static int ae9_direct_mute(struct hda_codec *codec, bool mute)
+static int ae9_dac_mute_locked(struct hda_codec *codec, bool mute)
 {
 	struct ca0132_spec *spec = codec->spec;
 	u8 value;
 
-	guard(mutex)(&spec->ae9_dac_mutex);
-	/* A failed transport must not let a later volume request release mute. */
-	if (mute)
-		spec->ae9_dac_forced_mute = true;
+	lockdep_assert_held(&spec->ae9_dac_mutex);
 	if (!spec->mem_base || readl(spec->mem_base + 0x210) == ~0U) {
 		ae9_dac_start_invalidate(spec);
 		return -ENODEV;
@@ -13745,8 +13806,37 @@ static int ae9_direct_mute(struct hda_codec *codec, bool mute)
 	/* No DAC acknowledgment: this remains a command cache. */
 	ca0113_mmio_command_set(codec, 0x48, 0x07, value);
 	spec->ae9_dac_reg7 = value;
-	spec->ae9_dac_forced_mute = mute;
 	return 0;
+}
+
+static int ae9_direct_mute(struct hda_codec *codec, bool mute)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	guard(mutex)(&spec->ae9_dac_mutex);
+	/* Keep the mute reason latched when the transport fails. */
+	if (mute)
+		spec->ae9_dac_forced_mute = true;
+	err = ae9_dac_mute_locked(codec, mute || spec->ae9_output_muted);
+	if (!err)
+		spec->ae9_dac_forced_mute = mute;
+	return err;
+}
+
+static int ae9_dac_output_mute(struct hda_codec *codec, bool mute)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	guard(mutex)(&spec->ae9_dac_mutex);
+	if (mute)
+		spec->ae9_output_muted = true;
+	err = ae9_dac_mute_locked(codec, mute || spec->ae9_dac_forced_mute);
+	if (!err)
+		spec->ae9_output_muted = mute;
+	return err;
 }
 
 static int ae9_direct_unbind(struct hda_codec *codec)
@@ -15857,9 +15947,8 @@ static void ae9_apply_output_path(struct hda_codec *codec)
 	if (spec->ae9_direct.enabled)
 		return;
 
-	ae9_dac_write(codec, 0x07, 0x80);		/* ES9038 unmuted */
-	ae9_dac_write(codec, 0x1d, hp ? 0x80 : 0x40);	/* front mute */
-	codec_info(codec, "AE-9 output path: %s (ES9038 unmuted, line-out %s)\n",
+	ae9_dac_write(codec, 0x1d, hp ? 0x80 : 0x40);
+	codec_info(codec, "AE-9 output path: %s (line-out %s)\n",
 		   hp ? "headphone" : "line-out", hp ? "muted" : "unmuted");
 }
 
@@ -15873,20 +15962,83 @@ static void ae9_acm_apply_regs(struct ca0132_spec *spec)
 	ae9_acm_setreg(spec, 0x02, spec->cur_out_type == HEADPHONE_OUT ? 0x40 : 0x00, 0x40);
 }
 
+/* The ACM worker owns UART; release output_mutex during the reply wait. */
+static int ae9_acm_read_output_locked(struct ca0132_spec *spec)
+{
+	unsigned int generation = spec->ae9_output_generation;
+	int value;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	mutex_unlock(&spec->ae9_output_mutex);
+	value = ae9_acm_getreg(spec, 0x02);
+	mutex_lock(&spec->ae9_output_mutex);
+	if (generation != spec->ae9_output_generation ||
+	    !spec->ae9_output_applied || spec->dsp_state != DSP_DOWNLOADED)
+		return -EAGAIN;
+	return value;
+}
+
 static void ae9_acm_apply_mode(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
+	bool hp, switching;
+	int err;
 
-	if (READ_ONCE(spec->ae9_acm_tx_failed))
-		return;
 	mutex_lock(&spec->ae9_output_mutex);
 	spec->ae9_acm_pending_mode = false;
 	if (!spec->ae9_output_applied || spec->dsp_state != DSP_DOWNLOADED)
 		goto out;
-	ae9_acm_apply_regs(spec);
-	if (READ_ONCE(spec->ae9_acm_tx_failed))
-		goto out;
+	hp = spec->cur_out_type == HEADPHONE_OUT;
+	switching = spec->ae9_output_muted;
+	if (READ_ONCE(spec->ae9_acm_tx_failed)) {
+		err = -EIO;
+		goto failed;
+	}
+	if (!switching && !spec->ae9_hp_amp_valid) {
+		err = ae9_acm_read_output_locked(spec);
+		if (err == -EAGAIN)
+			goto out;
+		/* RCA-only startup can continue without an attached ACM. */
+		if (err >= 0 && !!(err & 0x40) != hp) {
+			switching = true;
+			err = ae9_dac_output_mute(codec, true);
+			if (err < 0)
+				goto failed;
+		} else if (err >= 0) {
+			spec->ae9_hp_amp_on = hp;
+			spec->ae9_hp_amp_valid = true;
+		}
+	}
+	if (switching) {
+		/* A completed UART write alone does not confirm the amp state. */
+		spec->ae9_hp_amp_valid = false;
+		ae9_acm_apply_regs(spec);
+		if (READ_ONCE(spec->ae9_acm_tx_failed)) {
+			err = -EIO;
+			goto failed;
+		}
+		err = ae9_acm_read_output_locked(spec);
+		if (err == -EAGAIN)
+			goto out;
+		if (err < 0)
+			goto failed;
+		if (!!(err & 0x40) != hp) {
+			err = -EIO;
+			goto failed;
+		}
+		err = ae9_dac_volume_restore_locked(codec, true);
+		if (err < 0)
+			goto failed;
+	}
 	ae9_apply_output_path(codec);
+	if (switching) {
+		err = ae9_dac_output_mute(codec, false);
+		if (err < 0)
+			goto failed;
+		spec->ae9_hp_amp_on = hp;
+		spec->ae9_hp_amp_valid = true;
+		ae9_acm_display_changed(spec);
+	}
 	/* Reapplying the same output must not restart its label hold. */
 	if (spec->ae9_acm_display_phase != AE9_ACM_DISPLAY_LOGO &&
 	    (!spec->ae9_acm_label_valid ||
@@ -15899,6 +16051,10 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 			ae9_acm_set_display_phase(spec, AE9_ACM_DISPLAY_MODE);
 		}
 	}
+	goto out;
+failed:
+	if (switching)
+		codec_warn(codec, "AE-9: output switch kept muted: %d\n", err);
 out:
 	mutex_unlock(&spec->ae9_output_mutex);
 }
@@ -16012,10 +16168,11 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 	mutex_lock(&spec->ae9_output_mutex);
 	hp = spec->cur_out_type == HEADPHONE_OUT;
 	if (spec->ae9_output_applied && spec->dsp_state == DSP_DOWNLOADED &&
-	    !!(r2 & 0x40) != hp) {
+	    !spec->ae9_output_muted && !!(r2 & 0x40) != hp) {
 		codec_info(codec, "AE-9 ACM: HP amp bit is %s but output is %s, re-applying\n",
 			   (r2 & 0x40) ? "on" : "off", hp ? "headphone" : "speakers");
-		ae9_acm_apply_regs(spec);
+		if (!ae9_dac_output_mute(codec, true))
+			spec->ae9_acm_pending_mode = true;
 	}
 	mutex_unlock(&spec->ae9_output_mutex);
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
@@ -16043,6 +16200,14 @@ static void ae9_acm_invalidate_jacks(struct ca0132_spec *spec)
 
 	if (ca0132_quirk(spec) != QUIRK_AE9)
 		return;
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		spec->ae9_hp_amp_valid = false;
+		if (spec->ae9_output_applied &&
+		    (spec->ae9_hp_amp_on ||
+		     spec->cur_out_type == HEADPHONE_OUT) &&
+		    !ae9_dac_output_mute(spec->codec, true))
+			spec->ae9_acm_pending_mode = true;
+	}
 	spec->ae9_hp_jack_valid = false;
 	spec->ae9_hp_jack_rebase = true;
 	spec->ae9_acm_regs_logged = false;
@@ -16062,13 +16227,11 @@ static int ae9_acm_restore_controls(struct ca0132_spec *spec)
 		return -EAGAIN;
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
 		return -EIO;
-	ae9_acm_apply_regs(spec);
-	if (READ_ONCE(spec->ae9_acm_tx_failed))
-		return -EIO;
 	ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
 	if (READ_ONCE(spec->ae9_acm_tx_failed))
 		return -EIO;
-	spec->ae9_acm_pending_mode = false;
+	/* Reconcile the amp once the worker has confirmed the new marker. */
+	spec->ae9_acm_pending_mode = true;
 	spec->ae9_acm_pending_fx = false;
 	return 0;
 }
@@ -16232,6 +16395,20 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	return true;
 }
 
+/* Resolve a switch accepted before polling was disabled. */
+static void ae9_acm_park_output(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	bool pending;
+
+	scoped_guard(mutex, &spec->ae9_output_mutex) {
+		ae9_acm_park(spec);
+		pending = spec->ae9_acm_pending_mode && !spec->ae9_acm_needs_setup;
+	}
+	if (pending)
+		ae9_acm_apply_mode(codec);
+}
+
 /*
  * Execute the selected ACM job. Only service jobs advance the maintenance
  * tick and send GPIO 5 keepalive; knob/display jobs do not consume a
@@ -16278,18 +16455,21 @@ static void ae9_acm_work_fn(struct work_struct *work)
 	}
 	if (!spec->ae9_acm_present) {
 		if ((spec->ae9_acm_tick++ % 10) == 0) {
-			spec->ae9_acm_present = ae9_acm_init(codec);
-			if (spec->ae9_acm_present && !ae9_acm_poll) {
+			bool present = ae9_acm_init(codec);
+
+			scoped_guard(mutex, &spec->ae9_output_mutex)
+				WRITE_ONCE(spec->ae9_acm_present, present);
+			if (present && !ae9_acm_poll) {
+				ae9_acm_park_output(codec);
 				ae9_acm_show_volume(spec);
 				codec_info(codec, "AE-9 ACM: initialised; service parked (ae9_acm_poll=0)\n");
-				ae9_acm_park(spec);
 				return;		/* No reschedule while polling is disabled. */
 			}
 		}
 		goto out;
 	}
 	if (!ae9_acm_poll) {
-		ae9_acm_park(spec);
+		ae9_acm_park_output(codec);
 		return;			/* Runtime polling disabled. */
 	}
 	spec->ae9_acm_tick++;
@@ -16415,7 +16595,7 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	ae9_post_dsp_dac_init(codec);		/* ES9038 and device 0x49 registers. */
 	stage = "DAC volume";
 	scoped_guard(mutex, &spec->ae9_output_mutex)
-		err = ae9_dac_volume_restore_locked(codec);
+		err = ae9_dac_volume_restore_locked(codec, false);
 	if (err < 0)
 		goto fail;
 	ae9_post_dsp_finish(codec);		/* GPIO4 and DAC unmute. */
