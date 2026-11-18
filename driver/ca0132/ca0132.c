@@ -1402,7 +1402,7 @@ struct ca0132_spec {
 		bool valid, gpio5_high;
 	} ae9_dac_start;
 	u8 ae9_dac_reg7;
-	u8 ae9_dac_volume[2];
+	u8 ae9_acm_attenuation;
 	bool ae9_dac_user_muted;
 	bool ae9_dac_forced_mute;
 	/* Output mutex owns the confirmed route; DAC mutex also guards mute. */
@@ -8133,8 +8133,7 @@ static void ae9_dac_init_state(struct ca0132_spec *spec)
 {
 	mutex_init(&spec->ae9_dac_mutex);
 	spec->ae9_dac_reg7 = AE9_DAC_FILTER_DEFAULT | 1;
-	spec->ae9_dac_volume[0] = 0xff;
-	spec->ae9_dac_volume[1] = 0xff;
+	spec->ae9_acm_attenuation = 0xff;
 	spec->ae9_dac_user_muted = true;
 	spec->ae9_dac_forced_mute = true;
 }
@@ -8922,7 +8921,7 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 	unsigned int caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
 	bool muted;
 	int lval, rval;
-	u8 reg7;
+	u8 reg7, display_attenuation;
 
 	lockdep_assert_held(&spec->ae9_output_mutex);
 	lval = ae9_dac_attenuation(caps, left);
@@ -8933,6 +8932,8 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 		return rval;
 	left_on &= left || !(caps & AC_AMPCAP_MIN_MUTE);
 	right_on &= right || !(caps & AC_AMPCAP_MIN_MUTE);
+	/* Keep the display relative to the mixer level for this output. */
+	display_attenuation = min(left_on ? lval : 0xff, right_on ? rval : 0xff);
 	if (spec->cur_out_type == HEADPHONE_OUT) {
 		u8 steps = hp_steps[spec->ae5_headphone_gain_val];
 
@@ -8968,8 +8969,7 @@ static int ae9_dac_volume_apply(struct hda_codec *codec, long left, long right,
 	if (!(reg7 & 1) && reg7 != spec->ae9_dac_reg7)
 		ca0113_mmio_command_set(codec, 0x48, 0x07, reg7);
 	spec->ae9_dac_reg7 = reg7;
-	spec->ae9_dac_volume[0] = lval;
-	spec->ae9_dac_volume[1] = rval;
+	spec->ae9_acm_attenuation = display_attenuation;
 	spec->ae9_dac_user_muted = muted;
 	return 0;
 }
@@ -15695,12 +15695,11 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 
 	scoped_guard(mutex, &spec->ae9_dac_mutex) {
 		muted = spec->ae9_dac_user_muted;
-		attenuation = min(spec->ae9_dac_volume[0], spec->ae9_dac_volume[1]);
+		attenuation = spec->ae9_acm_attenuation;
 	}
 	if (muted) {
 		snprintf(txt, sizeof(txt), "MUTE");
 	} else {
-		/* Display the louder channel's commanded DAC attenuation. */
 		snprintf(txt, sizeof(txt), "%s%d.%d", attenuation ? "-" : "",
 			 attenuation / 2, (attenuation % 2) * 5);
 	}
